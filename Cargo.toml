@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name = "sherlock-nsf-parser"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Sherlock Forensics <info@sherlockforensics.com>"]
+license = "Apache-2.0"
+description = "Pure-Rust read-only parser for IBM/HCL Lotus Notes Storage Facility (NSF) databases. Forensic-grade, no Notes client required."
+repository = "https://github.com/Sherlock-Forensics/sherlock-nsf-parser"
+documentation = "https://docs.rs/sherlock-nsf-parser"
+readme = "README.md"
+keywords = ["nsf", "lotus-notes", "domino", "forensics", "parser"]
+categories = ["parser-implementations", "filesystem", "encoding"]
+
+# Single library crate, no binary - this is the building block other tools
+# (including sherlock-nsf-viewer) consume. Keep zero non-std runtime deps so
+# downstream binaries don't inherit a heavy dep tree just to read NSFs.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+# Fixture-driven regression tests will land here as we grow the corpus.
+# Empty for v0.1 (no published fixtures yet - see priorart_nsf_format.md
+# section "Sample-corpus availability" for the corpus plan).
+
+[features]
+default = []
