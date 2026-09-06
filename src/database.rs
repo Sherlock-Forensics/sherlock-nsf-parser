@@ -685,7 +685,30 @@ impl<'a> Database<'a> {
     /// themselves, and counting them without offering them is the coverage
     /// gap this project keeps finding.
     pub fn non_note_records(&self, en: &NoteEnumeration) -> Vec<NonNoteRecord> {
-        en.withheld
+        self.non_note_records_with_skipped(en).0
+    }
+
+    /// The same, plus how many non-note targets could NOT be offered because
+    /// they live in a bucket slot rather than at a file position.
+    ///
+    /// Locating a bucket slot needs the bucket walk, which this method does
+    /// not do. Returning the count separately means a caller can say "3 more
+    /// exist and are not listed here" instead of silently showing a shorter
+    /// list than the enumeration counted.
+    pub fn non_note_records_with_skipped(
+        &self,
+        en: &NoteEnumeration,
+    ) -> (Vec<NonNoteRecord>, usize) {
+        let skipped = en
+            .withheld
+            .iter()
+            .filter(|wh| {
+                matches!(wh.reason, WithheldReason::NotANoteRecord { .. })
+                    && matches!(wh.location, WithheldLocation::BucketSlot { .. })
+            })
+            .count();
+        let recs = en
+            .withheld
             .iter()
             .filter_map(|wh| {
                 let WithheldReason::NotANoteRecord { found_signature } = wh.reason else {
@@ -711,7 +734,8 @@ impl<'a> Database<'a> {
                     declared_len,
                 })
             })
-            .collect()
+            .collect();
+        (recs, skipped)
     }
 
     pub fn note_items_walk(&self, note: &ResolvedNote) -> crate::item::ItemWalk<'a> {
@@ -1002,6 +1026,28 @@ mod non_note_tests {
             declared_len: None,
         };
         assert!(r.bytes(&[0u8; 64]).is_none());
+    }
+
+    #[test]
+    fn corpus_counts_non_note_targets_by_location_kind() {
+        let Some(path) = corpus() else {
+            eprintln!("corpus not present; skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read");
+        let db = Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let (mut file_pos, mut bucket) = (0usize, 0usize);
+        for wh in &en.withheld {
+            if !matches!(wh.reason, WithheldReason::NotANoteRecord { .. }) {
+                continue;
+            }
+            match wh.location {
+                WithheldLocation::FilePosition { .. } => file_pos += 1,
+                WithheldLocation::BucketSlot { .. } => bucket += 1,
+            }
+        }
+        eprintln!("non-note targets: {file_pos} at a file position, {bucket} in a bucket slot");
     }
 
     #[test]
