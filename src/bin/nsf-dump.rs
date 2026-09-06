@@ -40,6 +40,13 @@ fn ts(t: &Timedate) -> String {
         .unwrap_or_else(|| t.as_hex_id())
 }
 
+/// Render an optional timestamp. A short (64-byte) note header ends before
+/// the creation-time field, so "absent" is printed as such rather than
+/// substituting a placeholder date.
+fn ts_opt(t: &Option<Timedate>) -> String {
+    t.as_ref().map(ts).unwrap_or_else(|| "(absent)".to_string())
+}
+
 fn print_fields(db: &Database<'_>, names: Option<&sherlock_nsf_parser::BucketDescriptorBlock>, n: &ResolvedNote) {
     println!(
         "\nfields of note rrv=0x{:08X} ({}) - {} items:",
@@ -179,7 +186,7 @@ fn main() {
             "  rrv=0x{:08X}  UNID={}  created={}  modified={}  items={}",
             n.rrv_identifier,
             n.header.unid_hex(),
-            ts(&n.header.creation_time),
+            ts_opt(&n.header.creation_time),
             ts(&n.header.modification_time),
             n.header.number_of_note_items,
         );

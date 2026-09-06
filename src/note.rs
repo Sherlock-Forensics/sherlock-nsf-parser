@@ -57,8 +57,18 @@ use crate::time::Timedate;
 
 /// Magic two bytes at offset 0 of every note header.
 pub const NOTE_SIGNATURE: [u8; 2] = [0x04, 0x00];
-/// Note header size in bytes.
+/// Full note header size in bytes, including the trailing timestamp and
+/// folder fields.
 pub const NOTE_HEADER_BYTES: usize = 100;
+/// Shortest note header that is still a complete record: the fields through
+/// `non_summary_data_size` end exactly at offset 64.
+///
+/// Records of exactly this length occur in real databases - 22 of them across
+/// the corpus, in contiguous bucket-slot runs - and carry a `size` field that
+/// self-declares 64 along with a matching `rrv_identifier`. They are genuine
+/// notes in a short form, not truncated garbage, so requiring the full 100
+/// bytes silently withheld them from enumeration.
+pub const NOTE_HEADER_SHORT_BYTES: usize = 64;
 
 /// Note class flag values. A note's `note_class` is typically one of
 /// these; multi-bit values are uncommon in practice.
@@ -117,28 +127,36 @@ pub struct NoteHeader {
     /// Size in bytes of the non-summary data area associated with this
     /// note.
     pub non_summary_data_size: u32,
-    /// Most recent access time.
-    pub access_time: Timedate,
-    /// File-creation time (first-write timestamp).
-    pub creation_time: Timedate,
-    /// NoteID of the parent (for response notes).
-    pub parent_note_identifier: u32,
-    /// Number of folders that reference this note.
-    pub folder_reference_count: u32,
-    /// NoteID of an associated folder (if any).
-    pub folder_note_identifier: u32,
+    /// Most recent access time. `None` in a short (64-byte) header, which
+    /// ends before this field.
+    pub access_time: Option<Timedate>,
+    /// File-creation time (first-write timestamp). `None` in a short
+    /// (64-byte) header, which ends before this field.
+    ///
+    /// Optional rather than defaulted because this is an evidentiary
+    /// timestamp: substituting an epoch or a zero here would present a
+    /// fabricated creation date as if it had been read from the record.
+    pub creation_time: Option<Timedate>,
+    /// NoteID of the parent (for response notes). `None` in a short header.
+    pub parent_note_identifier: Option<u32>,
+    /// Number of folders that reference this note. `None` in a short header.
+    pub folder_reference_count: Option<u32>,
+    /// NoteID of an associated folder (if any). `None` in a short header.
+    pub folder_note_identifier: Option<u32>,
 }
 
 impl NoteHeader {
     /// Parse a note header from at least the first 100 bytes of a note
     /// record. Errors on signature mismatch or short input.
     pub fn parse(bytes: &[u8]) -> Result<Self, NsfError> {
-        if bytes.len() < NOTE_HEADER_BYTES {
+        if bytes.len() < NOTE_HEADER_SHORT_BYTES {
             return Err(NsfError::TooShort {
                 actual: bytes.len(),
-                required: NOTE_HEADER_BYTES,
+                required: NOTE_HEADER_SHORT_BYTES,
             });
         }
+        // Trailing fields are present only in the full-length form.
+        let full = bytes.len() >= NOTE_HEADER_BYTES;
         if bytes[0] != NOTE_SIGNATURE[0] || bytes[1] != NOTE_SIGNATURE[1] {
             return Err(NsfError::BadFileSignature {
                 observed: [bytes[0], bytes[1]],
@@ -162,11 +180,19 @@ impl NoteHeader {
             number_of_responses: u16_at(54),
             non_summary_data_identifier: u32_at(56),
             non_summary_data_size: u32_at(60),
-            access_time: Timedate::from_bytes(&bytes[64..72])?,
-            creation_time: Timedate::from_bytes(&bytes[72..80])?,
-            parent_note_identifier: u32_at(80),
-            folder_reference_count: u32_at(86),
-            folder_note_identifier: u32_at(94),
+            access_time: if full {
+                Some(Timedate::from_bytes(&bytes[64..72])?)
+            } else {
+                None
+            },
+            creation_time: if full {
+                Some(Timedate::from_bytes(&bytes[72..80])?)
+            } else {
+                None
+            },
+            parent_note_identifier: full.then(|| u32_at(80)),
+            folder_reference_count: full.then(|| u32_at(86)),
+            folder_note_identifier: full.then(|| u32_at(94)),
         })
     }
 
@@ -209,6 +235,43 @@ impl NoteHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_short_64_byte_header_without_inventing_trailing_fields() {
+        // Real databases carry notes whose header is 64 bytes: the fields
+        // through non_summary_data_size end exactly there, and the record's
+        // own `size` field self-declares 64. 22 such records across the
+        // corpus were withheld from enumeration while parse() demanded the
+        // full 100 bytes.
+        let mut buf = synthetic_note(class::DOCUMENT, 3);
+        buf.truncate(NOTE_HEADER_SHORT_BYTES);
+
+        let h = NoteHeader::parse(&buf).expect("64-byte header must parse");
+        assert_eq!(h.note_class, class::DOCUMENT);
+        assert_eq!(h.number_of_note_items, 3);
+
+        // Fields past offset 64 are absent from the record and must be
+        // reported as absent, never defaulted - these are evidentiary
+        // timestamps and a substituted value would be a fabricated one.
+        assert!(h.access_time.is_none());
+        assert!(h.creation_time.is_none());
+        assert!(h.parent_note_identifier.is_none());
+        assert!(h.folder_reference_count.is_none());
+        assert!(h.folder_note_identifier.is_none());
+
+        // The full-length form still yields all of them.
+        let full = synthetic_note(class::DOCUMENT, 3);
+        let h = NoteHeader::parse(&full).expect("full header must parse");
+        assert!(h.creation_time.is_some());
+        assert!(h.folder_note_identifier.is_some());
+    }
+
+    #[test]
+    fn rejects_headers_shorter_than_the_short_form() {
+        let mut buf = synthetic_note(class::DOCUMENT, 1);
+        buf.truncate(NOTE_HEADER_SHORT_BYTES - 1);
+        assert!(NoteHeader::parse(&buf).is_err());
+    }
 
     fn synthetic_note(note_class: u16, item_count: u16) -> Vec<u8> {
         let mut buf = vec![0u8; NOTE_HEADER_BYTES + 32];

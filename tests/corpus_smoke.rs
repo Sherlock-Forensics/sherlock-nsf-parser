@@ -745,3 +745,52 @@ fn withheld_entries_are_classified_and_none_are_missed_notes() {
         e.missed_evidence_count(),
     );
 }
+
+#[test]
+fn no_corpus_database_reports_missed_evidence() {
+    // The strongest statement the parser can currently make: across every
+    // sample, no withheld RRV entry represents a note record it could not
+    // read. Every gap is either a stale entry whose slot was reused, or an
+    // entry addressing a non-note allocation.
+    //
+    // This started at 22 - short 64-byte note headers rejected for not
+    // being 100 bytes. The count is asserted at zero rather than at 22 so
+    // that any future regression, or any new sample carrying an unreadable
+    // note, fails here instead of quietly widening the gap.
+    let Some(root) = corpus_root() else {
+        eprintln!("corpus not present; skipping");
+        return;
+    };
+    let mut checked = 0;
+    let mut total_missed = 0;
+    for sub in ["hcl-templates-en", "hcl-templates-locale", "real-nsf"] {
+        let dir = root.join(sub);
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "nsf" | "ntf" | "nsg" | "box") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(db) = Database::open(&bytes) else { continue };
+            let Ok(e) = db.enumerate_notes() else { continue };
+            let missed = e.missed_evidence_count();
+            if missed > 0 {
+                eprintln!("{}: {missed} unreadable note records", path.display());
+            }
+            total_missed += missed;
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        total_missed, 0,
+        "{total_missed} RRV entries across {checked} databases point at note \
+         records the parser could not read"
+    );
+    eprintln!("no missed evidence across {checked} corpus databases");
+}
