@@ -478,15 +478,17 @@ impl<'a> Database<'a> {
                 continue;
             };
             for entry in iter {
-                let resolved = match entry.location {
+                let (resolved, location) = match entry.location {
                     RrvLocation::FilePosition {
                         file_position_pages,
                     } => {
                         out.file_position_total += 1;
                         let off = u64::from(file_position_pages) << 8;
-                        self.bytes
-                            .get(off as usize..)
-                            .and_then(|buf| self.note_if_matches(entry.rrv_identifier, off, buf))
+                        let r = match self.bytes.get(off as usize..) {
+                            Some(buf) => self.note_at(entry.rrv_identifier, off, buf),
+                            None => Err(WithheldReason::Unresolvable),
+                        };
+                        (r, WithheldLocation::FilePosition { file_position_pages })
                     }
                     RrvLocation::BucketSlot {
                         bucket_index,
@@ -494,48 +496,84 @@ impl<'a> Database<'a> {
                         ..
                     } => {
                         out.bucket_slot_total += 1;
-                        self.resolve_validated(&raw_fps, bucket_index, slot_index, entry.rrv_identifier)
+                        let r = self.resolve_validated(
+                            &raw_fps,
+                            bucket_index,
+                            slot_index,
+                            entry.rrv_identifier,
+                        );
+                        (r, WithheldLocation::BucketSlot { bucket_index, slot_index })
                     }
                 };
                 match resolved {
-                    Some(note) => out.notes.push(note),
-                    None => out.unresolved += 1,
+                    Ok(note) => out.notes.push(note),
+                    Err(reason) => {
+                        out.unresolved += 1;
+                        // Detail is capped so a corrupt database cannot make
+                        // enumeration allocate without bound. The count above
+                        // stays exact regardless.
+                        if out.withheld.len() < MAX_WITHHELD_DETAIL {
+                            out.withheld.push(WithheldEntry {
+                                rrv_identifier: entry.rrv_identifier,
+                                location,
+                                reason,
+                            });
+                        } else {
+                            out.withheld_truncated = true;
+                        }
+                    }
                 }
             }
         }
         Ok(out)
     }
 
-    /// Parse `buf` as a note header and return a [`ResolvedNote`] only if it
-    /// carries `expected_identifier` (the identity gate).
-    fn note_if_matches(
+    /// Parse `buf` as a note header and apply the identity gate, reporting
+    /// which way it failed so the caller can classify a withheld entry.
+    fn note_at(
         &self,
         expected_identifier: u32,
         file_offset: u64,
         buf: &[u8],
-    ) -> Option<ResolvedNote> {
+    ) -> Result<ResolvedNote, WithheldReason> {
         match NoteHeader::parse(buf) {
-            Ok(header) if header.rrv_identifier == expected_identifier => Some(ResolvedNote {
+            Ok(header) if header.rrv_identifier == expected_identifier => Ok(ResolvedNote {
                 rrv_identifier: expected_identifier,
                 file_offset,
                 header,
             }),
-            _ => None,
+            // Parsed as a note, but a different one. The characteristic
+            // shape of a stale RRV entry whose slot has been reused.
+            Ok(header) => Err(WithheldReason::IdentityMismatch {
+                found_identifier: header.rrv_identifier,
+                found_note_class: header.note_class,
+            }),
+            Err(_) => Err(WithheldReason::NotANoteRecord {
+                found_signature: u16::from_le_bytes([
+                    buf.first().copied().unwrap_or(0),
+                    buf.get(1).copied().unwrap_or(0),
+                ]),
+            }),
         }
     }
 
     /// Resolve a bucket-slot entry to an identity-verified note, trying the
-    /// raw descriptor first then group-marker-corrected candidates. Returns
-    /// `None` only if no candidate yields a note carrying `expected_id`.
+    /// raw descriptor first then group-marker-corrected candidates. Errors
+    /// only if no candidate yields a note carrying `expected_id`; the error
+    /// reports the most informative failure any candidate produced.
     fn resolve_validated(
         &self,
         raw_fps: &[u32],
         bucket_index: u32,
         slot_index: u16,
         expected_id: u32,
-    ) -> Option<ResolvedNote> {
-        let ord = (bucket_index as usize).checked_sub(1)?;
-        let primary = *raw_fps.get(ord)?;
+    ) -> Result<ResolvedNote, WithheldReason> {
+        let Some(ord) = (bucket_index as usize).checked_sub(1) else {
+            return Err(WithheldReason::Unresolvable);
+        };
+        let Some(&primary) = raw_fps.get(ord) else {
+            return Err(WithheldReason::Unresolvable);
+        };
         // High nibble (bits 16-19) of neighbouring descriptors, used to
         // repair a bits-16-19 group marker (buckets are locally sequential).
         let prev_hi = ord
@@ -552,6 +590,11 @@ impl<'a> Database<'a> {
             (primary & 0xFFF0_FFFF) | next_hi,        // bits-16-19 marker, next high nibble
         ];
 
+        // Best failure seen across the candidates. An IdentityMismatch says
+        // the slot was located and holds a real but different note, which is
+        // far more informative than "could not locate", so it outranks the
+        // other reasons when several candidates fail differently.
+        let mut best_err = WithheldReason::Unresolvable;
         for &fp in &candidates {
             let bucket_off = u64::from(fp) << 8;
             let Some(buf) = self.bytes.get(bucket_off as usize..) else {
@@ -564,11 +607,16 @@ impl<'a> Database<'a> {
                 continue;
             };
             let slot_off = bucket_off + (slot.as_ptr() as usize - buf.as_ptr() as usize) as u64;
-            if let Some(note) = self.note_if_matches(expected_id, slot_off, slot) {
-                return Some(note);
+            match self.note_at(expected_id, slot_off, slot) {
+                Ok(note) => return Ok(note),
+                Err(e) => {
+                    if e.rank() > best_err.rank() {
+                        best_err = e;
+                    }
+                }
             }
         }
-        None
+        Err(best_err)
     }
 
     /// Return a note's non-summary data object - the separately-stored
@@ -644,6 +692,99 @@ pub struct ResolvedNote {
     pub header: NoteHeader,
 }
 
+/// Upper bound on per-entry withheld detail retained by an enumeration. The
+/// `unresolved` count stays exact past this point; only the detail stops.
+pub const MAX_WITHHELD_DETAIL: usize = 10_000;
+
+/// Why an RRV entry did not yield an identity-verified note.
+///
+/// An examiner asked "did your tool miss anything?" needs a better answer
+/// than a bare count. These distinguish an entry that is *expected* to fail
+/// (a stale pointer into a reused slot - ordinary database churn) from one
+/// that indicates the resolver could not follow the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithheldReason {
+    /// The target parsed as a valid note record, but one carrying a
+    /// different `rrv_identifier`. The signature of a stale or superseded
+    /// RRV entry whose slot has since been reused by another note. Benign:
+    /// ordinary database churn, and the identity gate is doing its job.
+    IdentityMismatch {
+        /// The `rrv_identifier` actually found at the target.
+        found_identifier: u32,
+        /// The note class actually found at the target.
+        found_note_class: u16,
+    },
+    /// The target was located but did not parse as a note record.
+    ///
+    /// Measured over the corpus (506 such entries) this splits two ways, and
+    /// `found_signature` is what separates them:
+    ///
+    /// - **484 file-position entries**, carrying signature `0x001B` (428) or
+    ///   `0x0007` (56) - never the note signature. Every file-position RRV
+    ///   entry in the corpus lands here, and their identifiers are the
+    ///   reserved low RRVs (`0x106` is also the `initial_rrv_identifier` in
+    ///   the RRV bucket headers). These address database-internal
+    ///   allocations that were never notes, so withholding them is correct.
+    ///
+    /// - **22 bucket-slot entries**, carrying the note signature `0x0004`
+    ///   but failing header parse anyway - a truncated slot or an
+    ///   unparseable TIMEDATE. These are real note records the parser cannot
+    ///   yet read, and are tracked as a parser gap rather than accepted as
+    ///   normal.
+    ///
+    /// So a `found_signature` of `0x0004` here means evidence was missed; any
+    /// other value means the entry was never a note to begin with.
+    NotANoteRecord {
+        /// The 16-bit signature actually found at the target, so a report
+        /// can name the allocation class instead of only saying "not a note".
+        found_signature: u16,
+    },
+    /// The target could not be located: descriptor index out of range, the
+    /// bucket did not parse, or the slot index exceeded the bucket. This is
+    /// the reason that indicates a resolver gap rather than data churn.
+    Unresolvable,
+}
+
+impl WithheldReason {
+    /// Ordering used to pick the most informative failure across the
+    /// candidate descriptors tried for one bucket-slot entry.
+    fn rank(&self) -> u8 {
+        match self {
+            WithheldReason::Unresolvable => 0,
+            WithheldReason::NotANoteRecord { .. } => 1,
+            WithheldReason::IdentityMismatch { .. } => 2,
+        }
+    }
+}
+
+/// Where a withheld entry pointed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithheldLocation {
+    /// A direct file position, in 256-byte pages.
+    FilePosition {
+        /// Page number the entry named.
+        file_position_pages: u32,
+    },
+    /// A summary-bucket slot.
+    BucketSlot {
+        /// 1-based bucket index.
+        bucket_index: u32,
+        /// Slot within the bucket.
+        slot_index: u16,
+    },
+}
+
+/// One RRV entry that failed the identity gate, with the reason it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WithheldEntry {
+    /// The identifier the RRV entry claimed.
+    pub rrv_identifier: u32,
+    /// Where the entry pointed.
+    pub location: WithheldLocation,
+    /// Why no note was returned for it.
+    pub reason: WithheldReason,
+}
+
 /// Result of a full-database note enumeration via [`Database::enumerate_notes`].
 #[derive(Debug, Clone, Default)]
 pub struct NoteEnumeration {
@@ -651,10 +792,51 @@ pub struct NoteEnumeration {
     pub notes: Vec<ResolvedNote>,
     /// RRV entries that could not be resolved to a note carrying the
     /// expected identifier (failed the identity gate). Reported rather than
-    /// returned as possibly-wrong records.
+    /// returned as possibly-wrong records. Always exact.
     pub unresolved: u64,
+    /// Per-entry detail for the withheld entries, capped at
+    /// [`MAX_WITHHELD_DETAIL`]. Lets a report say *why* entries were
+    /// withheld rather than only how many.
+    pub withheld: Vec<WithheldEntry>,
+    /// True when more entries were withheld than `withheld` retains.
+    pub withheld_truncated: bool,
     /// Total bucket-slot RRV entries seen.
     pub bucket_slot_total: u64,
     /// Total file-position RRV entries seen.
     pub file_position_total: u64,
+}
+
+impl NoteEnumeration {
+    /// Count of withheld entries (among those with retained detail) that
+    /// carry `reason`'s discriminant.
+    pub fn withheld_count(&self, matches: impl Fn(&WithheldReason) -> bool) -> usize {
+        self.withheld.iter().filter(|w| matches(&w.reason)).count()
+    }
+
+    /// Number of withheld entries that indicate evidence the parser could
+    /// not read, as opposed to entries that were never notes.
+    ///
+    /// Counts [`WithheldReason::Unresolvable`] (the target could not be
+    /// located) and any [`WithheldReason::NotANoteRecord`] whose target
+    /// nonetheless carries the note signature (a note record that failed to
+    /// parse). An [`WithheldReason::IdentityMismatch`] is ordinary slot
+    /// reuse and a non-note signature was never a note, so neither counts.
+    pub fn missed_evidence_count(&self) -> usize {
+        self.withheld
+            .iter()
+            .filter(|w| match w.reason {
+                WithheldReason::Unresolvable => true,
+                WithheldReason::NotANoteRecord { found_signature } => {
+                    found_signature == u16::from_le_bytes(crate::note::NOTE_SIGNATURE)
+                }
+                WithheldReason::IdentityMismatch { .. } => false,
+            })
+            .count()
+    }
+
+    /// True when no withheld entry indicates missed evidence and the detail
+    /// is complete enough to say so.
+    pub fn all_gaps_explained(&self) -> bool {
+        !self.withheld_truncated && self.missed_evidence_count() == 0
+    }
 }

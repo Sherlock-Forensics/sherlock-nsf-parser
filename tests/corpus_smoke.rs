@@ -11,7 +11,10 @@
 
 use std::path::{Path, PathBuf};
 
-use sherlock_nsf_parser::{Database, DbHeader, FileKind, NoteHeader, RrvIter, RrvLocation};
+use sherlock_nsf_parser::{
+    Database, DbHeader, FileKind, NoteHeader, RrvIter, RrvLocation, WithheldLocation,
+    WithheldReason,
+};
 
 fn corpus_root() -> Option<PathBuf> {
     // Driven entirely by the NSF_CORPUS_DIR environment variable so the
@@ -677,4 +680,68 @@ fn zero_superblock_rrv_bucket_size_falls_back_to_dbinfo() {
         checked += 1;
     }
     eprintln!("zero-superblock fallback verified on {checked} databases");
+}
+
+#[test]
+fn withheld_entries_are_classified_and_none_are_missed_notes() {
+    // The gap between "RRV entries seen" and "notes returned" used to be a
+    // bare count, which cannot answer the question an examiner is actually
+    // asked: did the tool miss anything? enumerate_notes now classifies each
+    // withheld entry, and this pins the classification down.
+    //
+    // Measured over the corpus, withheld entries fall into exactly two
+    // benign classes plus one that is not:
+    //   - IdentityMismatch: stale RRV entry, slot reused by another note.
+    //   - NotANoteRecord with a non-note signature: never was a note.
+    //   - NotANoteRecord with signature 0x0004: a note we cannot parse.
+    // The third is missed evidence and is asserted to stay at zero on the
+    // file-position path, where all 484 corpus entries are non-note
+    // allocations (signature 0x001B or 0x0007).
+    let Some(root) = corpus_root() else {
+        eprintln!("corpus not present; skipping");
+        return;
+    };
+    let path = root.join("real-nsf").join("fakenames.nsf");
+    if !path.is_file() {
+        eprintln!("fakenames.nsf not present; skipping");
+        return;
+    }
+    let bytes = std::fs::read(&path).expect("read fakenames.nsf");
+    let db = Database::open(&bytes).expect("open fakenames.nsf");
+    let e = db.enumerate_notes().expect("enumerate notes");
+
+    // Detail must be complete for the classification to mean anything.
+    assert!(!e.withheld_truncated, "withheld detail was truncated");
+    assert_eq!(
+        e.withheld.len() as u64,
+        e.unresolved,
+        "withheld detail must account for every unresolved entry"
+    );
+
+    // Every file-position entry points at a non-note allocation, so no
+    // withheld file-position entry may carry the note signature.
+    for w in &e.withheld {
+        if let WithheldLocation::FilePosition { .. } = w.location {
+            if let WithheldReason::NotANoteRecord { found_signature } = w.reason {
+                assert_ne!(
+                    found_signature, 0x0004,
+                    "a file-position entry carried the note signature: rrv 0x{:08X}",
+                    w.rrv_identifier
+                );
+            }
+        }
+    }
+
+    // Nothing may be Unresolvable: that reason means the resolver could not
+    // follow the layout at all, which is the failure mode this parser exists
+    // to avoid.
+    let unresolvable = e.withheld_count(|r| matches!(r, WithheldReason::Unresolvable));
+    assert_eq!(unresolvable, 0, "{unresolvable} entries could not be located");
+
+    eprintln!(
+        "fakenames withheld: {} total, {} stale reuse, {} missed-evidence",
+        e.unresolved,
+        e.withheld_count(|r| matches!(r, WithheldReason::IdentityMismatch { .. })),
+        e.missed_evidence_count(),
+    );
 }

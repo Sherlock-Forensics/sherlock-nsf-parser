@@ -69,7 +69,10 @@ pub use bdb::{BucketDescriptorBlock, RrvBucketDescriptor, RrvBucketKind};
 pub use cd::{Attachment, AttachmentKind, NoteContent};
 pub use bdt::BucketDescriptorTable;
 pub use bucket::{Bucket, BucketHeader, BucketSlot};
-pub use database::{Database, NoteEnumeration, ResolvedNote};
+pub use database::{
+    Database, NoteEnumeration, ResolvedNote, WithheldEntry, WithheldLocation, WithheldReason,
+    MAX_WITHHELD_DETAIL,
+};
 pub use detect::{identify_file, FileKind};
 pub use error::NsfError;
 pub use header::DbHeader;
