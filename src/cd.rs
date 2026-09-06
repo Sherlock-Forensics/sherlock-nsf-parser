@@ -520,6 +520,41 @@ mod run_tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: why does the attachment note report zero items?"]
+    fn diagnose_zero_item_note() {
+        let root = std::env::var_os("NSF_CORPUS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(r"C:\SherlockForensics")
+                    .join(".scratch")
+                    .join("nsf-samples")
+            });
+        let path = root.join("real-nsf").join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        for n in en.notes.iter().filter(|n| db.note_items(n).is_empty()) {
+            eprintln!(
+                "note 0x{:08X} class 0x{:04X} size {} items_field {} nonsummary {} at 0x{:X}",
+                n.rrv_identifier,
+                n.header.note_class,
+                n.header.size,
+                n.header.number_of_note_items,
+                n.header.non_summary_data_size,
+                n.file_offset
+            );
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let head: Vec<String> = rec.iter().take(140).map(|b| format!("{b:02X}")).collect();
+            eprintln!("   first bytes: {}", head.join(" "));
+        }
+    }
+
+    #[test]
     fn corpus_bodies_decompose_into_runs() {
         let root = std::env::var_os("NSF_CORPUS_DIR")
             .map(std::path::PathBuf::from)

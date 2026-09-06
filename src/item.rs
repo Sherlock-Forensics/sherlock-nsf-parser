@@ -363,19 +363,81 @@ fn hex_summary(b: &[u8]) -> String {
 /// whose value would run past the record are dropped (truncated record);
 /// the walk stops there rather than emitting out-of-bounds slices.
 pub fn parse_items(record: &[u8], number_of_note_items: u16) -> Vec<NoteItem<'_>> {
+    walk_items(record, number_of_note_items).items
+}
+
+/// Why an item walk stopped short of the header's declared count.
+///
+/// A note that declares 139 items and yields none is not a note with no
+/// fields, and returning a bare empty vector for it makes the tool answer
+/// "there is nothing here" to a question it never managed to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemWalkStop {
+    /// Every declared item was read.
+    Complete,
+    /// The descriptor table itself does not fit inside the record.
+    TableDoesNotFit { needed: usize, record_len: usize },
+    /// An item's declared value size runs past the end of the record, so the
+    /// values are not all stored inside it. Measured across the corpus, 1412
+    /// of 42854 notes stop this way and 19584 declared items are never
+    /// reached. Where those values live is not yet known, and guessing would
+    /// be worse than saying so.
+    ValueOverrunsRecord {
+        index: usize,
+        declared_size: usize,
+        remaining: usize,
+    },
+}
+
+/// An item walk, with the accounting that says whether to trust it.
+#[derive(Debug, Clone)]
+pub struct ItemWalk<'a> {
+    pub items: Vec<NoteItem<'a>>,
+    /// What the note header said to expect.
+    pub claimed: u16,
+    pub stop: ItemWalkStop,
+}
+
+impl ItemWalk<'_> {
+    /// True when fewer items were recovered than the header declared.
+    pub fn incomplete(&self) -> bool {
+        self.items.len() < self.claimed as usize
+    }
+
+    /// Items the header declared that the walk never reached.
+    pub fn unreached(&self) -> usize {
+        (self.claimed as usize).saturating_sub(self.items.len())
+    }
+}
+
+/// Walk a note's items and report what happened, not only what worked.
+pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
     let count = number_of_note_items as usize;
     let table_end = NOTE_HEADER_BYTES + count * ITEM_DESCRIPTOR_BYTES;
     if record.len() < table_end {
-        return Vec::new();
+        return ItemWalk {
+            items: Vec::new(),
+            claimed: number_of_note_items,
+            stop: ItemWalkStop::TableDoesNotFit {
+                needed: table_end,
+                record_len: record.len(),
+            },
+        };
     }
     let mut items = Vec::with_capacity(count);
     let mut cursor = table_end;
+    let mut stop = ItemWalkStop::Complete;
     for i in 0..count {
         let d = NOTE_HEADER_BYTES + i * ITEM_DESCRIPTOR_BYTES;
         let name_id = u16::from_le_bytes([record[d], record[d + 1]]);
         let type_flags = u16::from_le_bytes([record[d + 2], record[d + 3]]);
         let value_size = u16::from_le_bytes([record[d + 4], record[d + 5]]) as usize;
         let Some(value) = record.get(cursor..cursor + value_size) else {
+            stop = ItemWalkStop::ValueOverrunsRecord {
+                index: i,
+                declared_size: value_size,
+                remaining: record.len().saturating_sub(cursor),
+            };
             break;
         };
         cursor += value_size;
@@ -385,7 +447,11 @@ pub fn parse_items(record: &[u8], number_of_note_items: u16) -> Vec<NoteItem<'_>
             value,
         });
     }
-    items
+    ItemWalk {
+        items,
+        claimed: number_of_note_items,
+        stop,
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +520,63 @@ mod tests {
         assert_eq!(items[1].display_value(), ""); // type-word placeholder
         assert_eq!(items[2].display_value(), "42");
         assert_eq!(items[3].display_value(), "99 99 99 99 99 99");
+    }
+
+    #[test]
+    fn a_walk_that_reaches_every_item_says_so() {
+        let rec = synthetic(&[(1, 0x000D, b"abc"), (2, 0x000D, b"de")]);
+        let w = walk_items(&rec, 2);
+        assert_eq!(w.items.len(), 2);
+        assert_eq!(w.claimed, 2);
+        assert_eq!(w.stop, ItemWalkStop::Complete);
+        assert!(!w.incomplete());
+        assert_eq!(w.unreached(), 0);
+    }
+
+    #[test]
+    fn a_value_running_past_the_record_is_reported_not_swallowed() {
+        // The measured corpus case: a note declares items whose values are
+        // not inside the record, and the walk returned an empty vector that
+        // a caller could only read as "this note has no fields".
+        let mut rec = synthetic(&[(1, 0x000D, b"abcdef")]);
+        rec.truncate(NOTE_HEADER_BYTES + ITEM_DESCRIPTOR_BYTES + 2);
+        let w = walk_items(&rec, 1);
+        assert!(w.items.is_empty());
+        assert!(w.incomplete());
+        assert_eq!(w.unreached(), 1);
+        match w.stop {
+            ItemWalkStop::ValueOverrunsRecord { index, declared_size, remaining } => {
+                assert_eq!(index, 0);
+                assert_eq!(declared_size, 6);
+                assert_eq!(remaining, 2);
+            }
+            other => panic!("expected an overrun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_that_does_not_fit_is_its_own_answer() {
+        let rec = vec![0u8; NOTE_HEADER_BYTES + 4];
+        let w = walk_items(&rec, 10);
+        assert!(w.items.is_empty());
+        assert!(w.incomplete());
+        assert!(matches!(w.stop, ItemWalkStop::TableDoesNotFit { .. }));
+    }
+
+    #[test]
+    fn a_partial_walk_keeps_what_it_reached() {
+        // Two of three fields is worth more than none, as long as the count
+        // says two of three.
+        let mut rec = synthetic(&[
+            (1, 0x000D, b"aa"),
+            (2, 0x000D, b"bb"),
+            (3, 0x000D, b"cccccccccc"),
+        ]);
+        rec.truncate(NOTE_HEADER_BYTES + 3 * ITEM_DESCRIPTOR_BYTES + 4);
+        let w = walk_items(&rec, 3);
+        assert_eq!(w.items.len(), 2);
+        assert_eq!(w.claimed, 3);
+        assert_eq!(w.unreached(), 1);
     }
 }
 

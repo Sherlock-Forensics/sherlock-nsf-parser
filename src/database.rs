@@ -668,6 +668,34 @@ impl<'a> Database<'a> {
     ///
     /// The record window is bounded to the note's declared `size` so item
     /// values cannot read into a neighbouring record.
+    /// Walk a note's items WITH the accounting: how many the header
+    /// declared, how many were recovered, and where the walk stopped.
+    ///
+    /// Measured on fakenames.nsf, four notes declare between 45 and 139
+    /// items and yield none, because the first item's declared value size
+    /// runs past the end of the record - a large note keeps its values
+    /// somewhere this build does not follow. Returning a bare empty vector
+    /// for those, as `note_items` must for compatibility, tells a caller
+    /// "this note has no fields" when the truth is "this note's fields were
+    /// not reachable".
+    pub fn note_items_walk(&self, note: &ResolvedNote) -> crate::item::ItemWalk<'a> {
+        let start = note.file_offset as usize;
+        let end = start
+            .saturating_add(note.header.size as usize)
+            .min(self.bytes.len());
+        let Some(record) = self.bytes.get(start..end) else {
+            return crate::item::ItemWalk {
+                items: Vec::new(),
+                claimed: note.header.number_of_note_items,
+                stop: crate::item::ItemWalkStop::TableDoesNotFit {
+                    needed: 0,
+                    record_len: 0,
+                },
+            };
+        };
+        crate::item::walk_items(record, note.header.number_of_note_items)
+    }
+
     pub fn note_items(&self, note: &ResolvedNote) -> Vec<crate::item::NoteItem<'a>> {
         let start = note.file_offset as usize;
         let end = start
