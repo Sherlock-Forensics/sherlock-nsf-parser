@@ -678,6 +678,42 @@ impl<'a> Database<'a> {
     /// for those, as `note_items` must for compatibility, tells a caller
     /// "this note has no fields" when the truth is "this note's fields were
     /// not reachable".
+    /// Collect the non-note records an enumeration withheld.
+    ///
+    /// The viewer shows these because "the RRV table points at 75 records
+    /// this build cannot read" is evidence an examiner may want to look at
+    /// themselves, and counting them without offering them is the coverage
+    /// gap this project keeps finding.
+    pub fn non_note_records(&self, en: &NoteEnumeration) -> Vec<NonNoteRecord> {
+        en.withheld
+            .iter()
+            .filter_map(|wh| {
+                let WithheldReason::NotANoteRecord { found_signature } = wh.reason else {
+                    return None;
+                };
+                let WithheldLocation::FilePosition { file_position_pages } = wh.location else {
+                    // A bucket slot needs the bucket walk to locate; not
+                    // offered rather than guessed at.
+                    return None;
+                };
+                let off = u64::from(file_position_pages) << 8;
+                let declared_len = self
+                    .bytes
+                    .get(off as usize + 2..off as usize + 6)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .filter(|len| {
+                        *len > 0 && (off as usize).saturating_add(*len as usize) <= self.bytes.len()
+                    });
+                Some(NonNoteRecord {
+                    rrv_identifier: wh.rrv_identifier,
+                    file_offset: off,
+                    signature: found_signature,
+                    declared_len,
+                })
+            })
+            .collect()
+    }
+
     pub fn note_items_walk(&self, note: &ResolvedNote) -> crate::item::ItemWalk<'a> {
         let start = note.file_offset as usize;
         let end = start
@@ -706,6 +742,39 @@ impl<'a> Database<'a> {
             return Vec::new();
         };
         crate::item::parse_items(record, note.header.number_of_note_items)
+    }
+}
+
+/// A record the RRV table points at that is not a note.
+///
+/// Measured on fakenames.nsf: 75 of these, every one carrying signature
+/// 0x001B, between 1KB and 7KB, and DENSE with data - one is 3997 non-zero
+/// bytes out of 4115. They are live records holding real content that this
+/// build cannot interpret, which is a different thing from empty space and
+/// a different thing again from a note it failed to read.
+///
+/// The bytes are offered as they are. Nothing here claims to know their
+/// internal structure.
+#[derive(Debug, Clone)]
+pub struct NonNoteRecord {
+    /// The identifier the RRV entry claimed.
+    pub rrv_identifier: u32,
+    /// Byte offset of the record in the file.
+    pub file_offset: u64,
+    /// The 16-bit signature found there.
+    pub signature: u16,
+    /// Length declared by the record's own u32 at offset 2, when that value
+    /// is plausible (non-zero and inside the file). `None` means the length
+    /// could not be established, and the caller must not invent one.
+    pub declared_len: Option<u32>,
+}
+
+impl NonNoteRecord {
+    /// The record's bytes, when a plausible length was declared.
+    pub fn bytes<'a>(&self, file: &'a [u8]) -> Option<&'a [u8]> {
+        let len = self.declared_len? as usize;
+        let start = self.file_offset as usize;
+        file.get(start..start.checked_add(len)?)
     }
 }
 
@@ -867,5 +936,82 @@ impl NoteEnumeration {
     /// is complete enough to say so.
     pub fn all_gaps_explained(&self) -> bool {
         !self.withheld_truncated && self.missed_evidence_count() == 0
+    }
+}
+
+#[cfg(test)]
+mod non_note_tests {
+    use super::*;
+
+    fn corpus() -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(CORPUS_ROOT)
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        p.is_file().then_some(p)
+    }
+
+    const CORPUS_ROOT: &str = r"C:\SherlockForensics\.scratch\nsf-samples";
+
+    /// The records are real: dense with data rather than free space, and
+    /// every withheld non-note entry is offered rather than counted.
+    #[test]
+    fn corpus_non_note_records_are_live_records_with_content() {
+        let Some(path) = corpus() else {
+            eprintln!("corpus not present; skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read");
+        let db = Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let recs = db.non_note_records(&en);
+        let withheld_non_note = en
+            .withheld
+            .iter()
+            .filter(|w| matches!(w.reason, WithheldReason::NotANoteRecord { .. }))
+            .count();
+        assert_eq!(recs.len(), withheld_non_note, "every non-note entry is offered");
+        assert!(!recs.is_empty(), "the corpus should hold some");
+
+        let mut with_bytes = 0usize;
+        let mut dense = 0usize;
+        for r in &recs {
+            assert_eq!(r.signature, 0x001B, "one class in this database");
+            if let Some(b) = r.bytes(&bytes) {
+                with_bytes += 1;
+                // Free space would be zeros; these are not.
+                if b.iter().filter(|x| **x != 0).count() * 4 > b.len() {
+                    dense += 1;
+                }
+            }
+        }
+        eprintln!(
+            "non-note records: {} total, {with_bytes} with a plausible length, {dense} dense",
+            recs.len()
+        );
+        assert!(dense > 0, "these records hold content, which is why they are offered");
+    }
+
+    #[test]
+    fn a_record_with_no_plausible_length_offers_no_bytes() {
+        // Inventing a length would hand the operator a slice of whatever
+        // followed it, labelled as a record.
+        let r = NonNoteRecord {
+            rrv_identifier: 1,
+            file_offset: 0,
+            signature: 0x001B,
+            declared_len: None,
+        };
+        assert!(r.bytes(&[0u8; 64]).is_none());
+    }
+
+    #[test]
+    fn a_length_past_the_end_of_the_file_is_refused() {
+        let r = NonNoteRecord {
+            rrv_identifier: 1,
+            file_offset: 32,
+            signature: 0x001B,
+            declared_len: Some(1000),
+        };
+        assert!(r.bytes(&[0u8; 64]).is_none());
     }
 }

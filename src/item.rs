@@ -901,6 +901,67 @@ mod overflow_diagnostics {
         eprintln!("SIZE FIT: {fits_at_64} fit with a 64-byte header, {fits_at_100} with 100, {neither} neither");
     }
 
+    /// What is actually INSIDE the 0x001B object records? If they hold file
+    /// data, the name-only attachments have their bytes here.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_object_payloads() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut shown = 0;
+        for wh in &en.withheld {
+            if !matches!(
+                wh.reason,
+                crate::WithheldReason::NotANoteRecord { found_signature: 0x001B }
+            ) {
+                continue;
+            }
+            let crate::WithheldLocation::FilePosition { file_position_pages } = wh.location else {
+                continue;
+            };
+            if shown >= 8 {
+                break;
+            }
+            shown += 1;
+            let off = (file_position_pages as usize) * 256;
+            let len = bytes
+                .get(off + 2..off + 6)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                .unwrap_or(0);
+            let body = bytes.get(off..off + len.min(64 * 1024)).unwrap_or(&[]);
+            let nonzero = body.iter().filter(|b| **b != 0).count();
+            let first_nz = body.iter().skip(6).position(|b| *b != 0);
+            eprintln!(
+                "   rrv 0x{:08X} len {len:6} nonzero {nonzero}/{} first_nz_after_hdr {:?}",
+                wh.rrv_identifier,
+                body.len(),
+                first_nz
+            );
+            for base in [0usize] {
+                let w = bytes.get(off + base..off + base + 24).unwrap_or(&[]);
+                let printable: String = w
+                    .iter()
+                    .map(|b| if b.is_ascii_graphic() { *b as char } else { '.' })
+                    .collect();
+                let hex: Vec<String> = w.iter().take(8).map(|b| format!("{b:02X}")).collect();
+                eprintln!(
+                    "   rrv 0x{:08X} len {len:6} base {base:2}: {} | {printable}",
+                    wh.rrv_identifier,
+                    hex.join(" ")
+                );
+            }
+        }
+    }
+
     /// Does an object record's length match a note's unreached value sum?
     #[test]
     #[ignore = "diagnostic"]
