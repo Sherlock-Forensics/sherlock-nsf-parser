@@ -119,13 +119,65 @@ impl NoteContent {
     }
 }
 
-fn image_ext(image_type: u16) -> &'static str {
+/// Extension implied by the CDIMAGEHEADER image-type code.
+///
+/// Only a fallback: the code is not reliable. Across the corpus 81 images
+/// carrying type 2 (JPEG) are PNG data, so this is consulted only when the
+/// reassembled bytes match no known signature.
+fn image_ext_from_type(image_type: u16) -> &'static str {
     match image_type {
         1 => "gif",
         2 => "jpg",
         3 => "bmp",
+        4 => "png",
         _ => "img",
     }
+}
+
+/// Extension implied by the reassembled bytes themselves.
+///
+/// Preferred over the declared type code because the bytes are what the
+/// operator will export and open. Naming PNG data `image_3.jpg` mislabels an
+/// artifact that a downstream tool then refuses to open, and in an
+/// evidentiary export a wrong extension is a wrong claim about the file.
+fn image_ext_from_magic(data: &[u8]) -> Option<&'static str> {
+    // Byte values rather than escaped literals: these signatures are binary,
+    // and an escape that survives one editing pass wrong becomes a signature
+    // that silently never matches.
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const JPG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    const GIF87: &[u8] = b"GIF87a";
+    const GIF89: &[u8] = b"GIF89a";
+    const BMP: &[u8] = b"BM";
+    const TIF_LE: &[u8] = &[0x49, 0x49, 0x2A, 0x00];
+    const TIF_BE: &[u8] = &[0x4D, 0x4D, 0x00, 0x2A];
+    const RIFF: &[u8] = b"RIFF";
+    const SIGS: &[(&[u8], &str)] = &[
+        (PNG, "png"),
+        (JPG, "jpg"),
+        (GIF87, "gif"),
+        (GIF89, "gif"),
+        (BMP, "bmp"),
+        (TIF_LE, "tif"),
+        (TIF_BE, "tif"),
+        (RIFF, "webp"),
+    ];
+    for (sig, ext) in SIGS {
+        if data.starts_with(sig) {
+            // RIFF is a container; only call it webp when it says so.
+            if *ext == "webp" && !(data.len() >= 12 && &data[8..12] == b"WEBP") {
+                continue;
+            }
+            return Some(ext);
+        }
+    }
+    None
+}
+
+/// Extension for a reconstructed image: content first, declared type as the
+/// fallback.
+fn image_ext(image_type: u16, data: &[u8]) -> &'static str {
+    image_ext_from_magic(data).unwrap_or_else(|| image_ext_from_type(image_type))
 }
 
 /// First >= 3-char printable run in a CDFILEHEADER body (the file name).
@@ -178,7 +230,7 @@ pub fn parse(obj: &[u8]) -> NoteContent {
             if !data.is_empty() {
                 *n += 1;
                 content.attachments.push(Attachment {
-                    name: format!("image_{n}.{}", image_ext(ty)),
+                    name: format!("image_{n}.{}", image_ext(ty, &data)),
                     data,
                     kind: AttachmentKind::Image,
                 });
@@ -249,5 +301,54 @@ mod tests {
     #[test]
     fn parse_empty_is_empty() {
         assert!(parse(&[0u8; 0x44]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod image_ext_tests {
+    use super::*;
+
+    const PNG_BYTES: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const JPG_BYTES: [u8; 3] = [0xFF, 0xD8, 0xFF];
+
+    #[test]
+    fn content_overrides_a_wrong_declared_type() {
+        // The case that motivated this: across the corpus 81 images declare
+        // CDIMAGEHEADER type 2 (JPEG) and hold PNG data. Naming those
+        // image_N.jpg mislabels every one of them on export.
+        assert_eq!(image_ext(2, &PNG_BYTES), "png");
+        assert_eq!(image_ext(1, &PNG_BYTES), "png");
+    }
+
+    #[test]
+    fn declared_type_is_used_when_the_bytes_say_nothing() {
+        assert_eq!(image_ext(1, b"not a known signature"), "gif");
+        assert_eq!(image_ext(2, b"not a known signature"), "jpg");
+        assert_eq!(image_ext(3, b"not a known signature"), "bmp");
+        assert_eq!(image_ext(4, b"not a known signature"), "png");
+        assert_eq!(image_ext(99, b"not a known signature"), "img");
+    }
+
+    #[test]
+    fn empty_data_falls_back_to_the_declared_type() {
+        assert_eq!(image_ext(2, &[]), "jpg");
+    }
+
+    #[test]
+    fn recognises_the_common_signatures() {
+        assert_eq!(image_ext_from_magic(&JPG_BYTES), Some("jpg"));
+        assert_eq!(image_ext_from_magic(b"GIF89a...."), Some("gif"));
+        assert_eq!(image_ext_from_magic(b"GIF87a...."), Some("gif"));
+        assert_eq!(image_ext_from_magic(b"BM.."), Some("bmp"));
+        assert_eq!(image_ext_from_magic(&[0x49, 0x49, 0x2A, 0x00]), Some("tif"));
+        assert_eq!(image_ext_from_magic(b"no"), None);
+    }
+
+    #[test]
+    fn riff_is_only_webp_when_it_says_webp() {
+        // A RIFF container can be WAV or AVI; claiming webp on the container
+        // magic alone would rename audio to an image extension.
+        assert_eq!(image_ext_from_magic(b"RIFF____WEBPmore"), Some("webp"));
+        assert_eq!(image_ext_from_magic(b"RIFF____WAVEfmt "), None);
     }
 }

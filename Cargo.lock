@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "sherlock-nsf-parser"
-version = "0.1.3"
+version = "0.1.4"
