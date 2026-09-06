@@ -632,18 +632,31 @@ impl<'a> Database<'a> {
     /// object including that header; record-level decoding (CD records,
     /// attachment extraction) is a later slice.
     pub fn non_summary_data(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
-        let id = note.header.non_summary_data_identifier;
-        let size = note.header.non_summary_data_size as usize;
-        if id == 0 || size < 10 {
+        self.object_bytes(
+            note.header.non_summary_data_identifier,
+            note.header.non_summary_data_size,
+            note.rrv_identifier,
+        )
+    }
+
+    /// The same lookup from raw header values, for a record that is not a
+    /// `ResolvedNote` - a carved candidate, for instance.
+    ///
+    /// The identity check is the point and is not optional: the object
+    /// header must carry the same RRV the caller expects, so a stale or
+    /// wrong identifier returns `None` rather than unrelated bytes. A carved
+    /// candidate is unverified as a note, but the object it points at either
+    /// matches its identifier or is not returned.
+    pub fn object_bytes(&self, identifier: u32, size: u32, expect_rrv: u32) -> Option<&'a [u8]> {
+        let size = size as usize;
+        if identifier == 0 || size < 10 {
             return None;
         }
-        let off = (u64::from(id) << 8) as usize;
+        let off = (u64::from(identifier) << 8) as usize;
         let obj = self.bytes.get(off..off.checked_add(size)?)?;
-        // Validate the object header against the note's own metadata so a
-        // wrong / stale identifier never returns unrelated bytes.
         let hdr_size = u32::from_le_bytes([obj[2], obj[3], obj[4], obj[5]]) as usize;
         let hdr_rrv = u32::from_le_bytes([obj[6], obj[7], obj[8], obj[9]]);
-        if obj[0] != 0x10 || obj[1] != 0x00 || hdr_size != size || hdr_rrv != note.rrv_identifier {
+        if obj[0] != 0x10 || obj[1] != 0x00 || hdr_size != size || hdr_rrv != expect_rrv {
             return None;
         }
         Some(obj)
