@@ -396,6 +396,12 @@ pub struct ItemWalk<'a> {
     /// What the note header said to expect.
     pub claimed: u16,
     pub stop: ItemWalkStop,
+    /// Name ids of the declared items the walk did not reach, read from the
+    /// descriptor table (which is intact - it is the VALUES that are not in
+    /// the record). Naming them turns "some fields are missing" into "these
+    /// fields are missing", which is the difference between an alarm and a
+    /// finding.
+    pub unreached_name_ids: Vec<u16>,
 }
 
 impl ItemWalk<'_> {
@@ -422,6 +428,7 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
                 needed: table_end,
                 record_len: record.len(),
             },
+            unreached_name_ids: Vec::new(),
         };
     }
     let mut items = Vec::with_capacity(count);
@@ -447,10 +454,17 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
             value,
         });
     }
+    let unreached_name_ids = (items.len()..count)
+        .filter_map(|i| {
+            let d = NOTE_HEADER_BYTES + i * ITEM_DESCRIPTOR_BYTES;
+            Some(u16::from_le_bytes([*record.get(d)?, *record.get(d + 1)?]))
+        })
+        .collect();
     ItemWalk {
         items,
         claimed: number_of_note_items,
         stop,
+        unreached_name_ids,
     }
 }
 
@@ -581,6 +595,113 @@ mod tests {
 }
 
 #[cfg(test)]
+    /// What KIND of field is going unread? If they are the rich-text and
+    /// attachment fields, their values legitimately live in the note's
+    /// non-summary object, which this tool already reads separately - and
+    /// the coverage warning would be alarming about something covered.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_unreached_field_kinds() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let bdb = db.bucket_descriptor_block().expect("bdb").expect("bdb");
+        let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut by_name: std::collections::BTreeMap<String, usize> = Default::default();
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            for id in &w.unreached_name_ids {
+                let kind = bdb.field_kind(*id);
+                *by_kind.entry(format!("{:?}", kind)).or_default() += 1;
+                let name = bdb
+                    .unk_names
+                    .get(*id as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("0x{id:04X}"));
+                *by_name.entry(name).or_default() += 1;
+            }
+        }
+        eprintln!("UNREACHED BY KIND:");
+        for (k, n) in &by_kind {
+            eprintln!("   {k:<16} {n}");
+        }
+        eprintln!("UNREACHED BY NAME (top):");
+        let mut v: Vec<_> = by_name.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, n) in v.into_iter().take(12) {
+            eprintln!("   {name:<28} {n}");
+        }
+    }
+
+    /// Compare the item table of a note that walks cleanly with one that
+    /// stops immediately, to see what actually differs.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_incomplete_item_tables() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut good = 0usize;
+        let mut bad = 0usize;
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            let show = if w.incomplete() && bad < 2 {
+                bad += 1;
+                true
+            } else if !w.incomplete() && w.claimed > 5 && good < 2 {
+                good += 1;
+                true
+            } else {
+                false
+            };
+            if !show {
+                continue;
+            }
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            eprintln!(
+                "{} note 0x{:08X} class 0x{:04X} size {} claimed {} recovered {} nonsummary {}",
+                if w.incomplete() { "BAD " } else { "GOOD" },
+                n.rrv_identifier,
+                n.header.note_class,
+                n.header.size,
+                w.claimed,
+                w.items.len(),
+                n.header.non_summary_data_size
+            );
+            for k in 0..6usize {
+                let d = NOTE_HEADER_BYTES + k * ITEM_DESCRIPTOR_BYTES;
+                if d + 8 > rec.len() {
+                    break;
+                }
+                eprintln!(
+                    "     desc[{k}] name 0x{:04X} type 0x{:04X} size {:6} tail 0x{:04X}",
+                    u16::from_le_bytes([rec[d], rec[d + 1]]),
+                    u16::from_le_bytes([rec[d + 2], rec[d + 3]]),
+                    u16::from_le_bytes([rec[d + 4], rec[d + 5]]),
+                    u16::from_le_bytes([rec[d + 6], rec[d + 7]]),
+                );
+            }
+        }
+    }
+
 mod text_list_tests {
     use super::*;
 
