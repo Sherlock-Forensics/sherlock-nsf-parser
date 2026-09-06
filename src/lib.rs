@@ -5,7 +5,8 @@
 //!
 //! - File-shape identification ([`detect`])
 //! - Database header parsing ([`header::DbHeader`]) - ODS version,
-//!   database id, encryption flag, template flag, BDB position
+//!   database id, template flag, BDB position (the encryption flag is
+//!   NOT among these - see below)
 //! - Database information extension block 2 parsing
 //!   ([`info2::Information2`]) - 4 superblock positions + 2 BDB positions
 //!   + bucket-size knobs
@@ -33,7 +34,14 @@
 //! Coming in subsequent slices:
 //!
 //! - Form-based dispatch (Memo / Person / Appointment / ...)
-//! - Item-level encryption decryption (detected + flagged today)
+//! - Encryption DETECTION, which is not implemented at all today. This
+//!   line previously read "detected + flagged today", which was wrong:
+//!   `DbHeader::is_database_encrypted` returns `None` unconditionally
+//!   because the authoritative flag bit is not known. A consumer must
+//!   treat the absence of an encryption finding as "not checked",
+//!   never as "not encrypted".
+//! - Item-level decryption, which additionally requires a Notes ID file
+//!   and its password; without the key it is not a parsing problem.
 //!
 //! See the project README for current capability status and the
 //! companion `priorart_nsf_format.md` for the design rationale and
