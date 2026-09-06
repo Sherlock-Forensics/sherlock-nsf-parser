@@ -618,7 +618,23 @@ mod tests {
 ///   the value byte for byte, so a correct offset would decode and a wrong
 ///   one cannot. The size arithmetic matching was a coincidence.
 ///
-/// The values' location remains unknown. Nothing here guesses at it.
+/// A second attempt then looked at the object store rather than the
+/// non-summary object:
+///
+/// - `diagnose_withheld_signatures`: every non-note RRV target in
+///   fakenames.nsf carries ONE signature, 0x001B - 75 of them. So there is a
+///   single object class, and it is a candidate home for the missing values.
+/// - `diagnose_object_records`: those records are `1B 00` then a u32 length
+///   then a short header, and their lengths run from ~1KB to ~7KB.
+/// - `diagnose_object_length_matches_unreached_sum`: but there are only 75
+///   of them against 617 incomplete notes, and matching lengths to unreached
+///   sums gives no consistent offset (best diffs scatter across -32..+55
+///   with no mode). They cannot account for the gap.
+///
+/// The values' location remains unknown. Nothing here guesses at it, and
+/// black-box probing has now been tried twice; the next attempt should come
+/// from a format reference or from a database where the same note can be
+/// compared against a known-good export.
 #[cfg(test)]
 mod overflow_diagnostics {
     use super::*;
@@ -883,6 +899,173 @@ mod overflow_diagnostics {
             }
         }
         eprintln!("SIZE FIT: {fits_at_64} fit with a 64-byte header, {fits_at_100} with 100, {neither} neither");
+    }
+
+    /// Does an object record's length match a note's unreached value sum?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_object_length_matches_unreached_sum() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        // Every object record: (rrv, file offset, declared length).
+        let mut objects: Vec<(u32, usize, usize)> = Vec::new();
+        for wh in &en.withheld {
+            if !matches!(
+                wh.reason,
+                crate::WithheldReason::NotANoteRecord { found_signature: 0x001B }
+            ) {
+                continue;
+            }
+            if let crate::WithheldLocation::FilePosition { file_position_pages } = wh.location {
+                let off = (file_position_pages as usize) * 256;
+                if let Some(b) = bytes.get(off + 2..off + 6) {
+                    let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+                    objects.push((wh.rrv_identifier, off, len));
+                }
+            }
+        }
+        eprintln!("objects: {}", objects.len());
+        let mut matched = 0usize;
+        let mut offsets: std::collections::BTreeMap<i64, usize> = Default::default();
+        let mut incomplete = 0usize;
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            if !w.incomplete() {
+                continue;
+            }
+            incomplete += 1;
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let count = n.header.number_of_note_items as usize;
+            let mut unreached_sum = 0usize;
+            for k in w.items.len()..count {
+                let d = NOTE_HEADER_BYTES + k * ITEM_DESCRIPTOR_BYTES;
+                if d + 8 > rec.len() {
+                    break;
+                }
+                unreached_sum += u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+            }
+            // Any object within 64 bytes of that size?
+            if let Some((_, _, len)) = objects
+                .iter()
+                .min_by_key(|(_, _, len)| (*len as i64 - unreached_sum as i64).abs())
+            {
+                let diff = *len as i64 - unreached_sum as i64;
+                if diff.abs() <= 64 {
+                    matched += 1;
+                    *offsets.entry(diff).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("{incomplete} incomplete notes, {matched} have an object within 64 bytes of their unreached sum");
+        let mut v: Vec<_> = offsets.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (d, n) in v.into_iter().take(8) {
+            eprintln!("   diff {d:>6}  {n}");
+        }
+    }
+
+    /// Dump the 0x001B records: what do they hold, and how big are they?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_object_records() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut shown = 0;
+        for wh in &en.withheld {
+            let crate::WithheldReason::NotANoteRecord { found_signature } = &wh.reason else {
+                continue;
+            };
+            if *found_signature != 0x001B || shown >= 6 {
+                continue;
+            }
+            let crate::WithheldLocation::FilePosition { file_position_pages } = wh.location else {
+                eprintln!("   rrv 0x{:08X} lives in a bucket slot", wh.rrv_identifier);
+                shown += 1;
+                continue;
+            };
+            let off = (file_position_pages as usize) * 256;
+            let head: Vec<String> = bytes
+                .get(off..off + 48)
+                .unwrap_or(&[])
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            // A record's length usually follows its 2-byte signature.
+            let len16 = bytes
+                .get(off + 2..off + 4)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let len32 = bytes
+                .get(off + 2..off + 6)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0);
+            eprintln!(
+                "   rrv 0x{:08X} at 0x{off:X} len16 {len16} len32 {len32}: {}",
+                wh.rrv_identifier,
+                head.join(" ")
+            );
+            shown += 1;
+        }
+    }
+
+    /// What ARE the withheld non-note records? If some of them are the
+    /// object store, the missing item values may be inside them.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_withheld_signatures() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut sigs: std::collections::BTreeMap<u16, usize> = Default::default();
+        let mut reasons: std::collections::BTreeMap<&str, usize> = Default::default();
+        for wh in &en.withheld {
+            match &wh.reason {
+                crate::WithheldReason::NotANoteRecord { found_signature } => {
+                    *reasons.entry("NotANoteRecord").or_default() += 1;
+                    *sigs.entry(*found_signature).or_default() += 1;
+                }
+                crate::WithheldReason::IdentityMismatch { .. } => {
+                    *reasons.entry("IdentityMismatch").or_default() += 1;
+                }
+                crate::WithheldReason::Unresolvable => {
+                    *reasons.entry("Unresolvable").or_default() += 1;
+                }
+            }
+        }
+        eprintln!("WITHHELD: {} entries {reasons:?}", en.withheld.len());
+        let mut v: Vec<_> = sigs.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (sig, n) in v.into_iter().take(10) {
+            eprintln!("   signature 0x{sig:04X}  {n}");
+        }
     }
 
     /// Test one hypothesis: when the walk stops, is the first unreached
