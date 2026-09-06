@@ -31,6 +31,10 @@ pub const CD_STREAM_START: usize = 0x44;
 
 // Signature low-byte constants.
 const SIG_TEXT: u8 = 0x85;
+/// CDPARAGRAPH. Its presence IS the paragraph break; the payload carries
+/// nothing a renderer needs, which is why the flattened text has newlines
+/// and why a structured body has to see the record at all.
+const SIG_PARAGRAPH: u8 = 0x6D;
 const SIG_IMAGEHEADER: u8 = 0x7D;
 const SIG_IMAGESEGMENT: u8 = 0x7C;
 const SIG_FILEHEADER: u8 = 0xA9;
@@ -103,11 +107,56 @@ pub struct Attachment {
     pub kind: AttachmentKind,
 }
 
+/// Character emphasis carried in a CDTEXT run's FONTID attributes.
+///
+/// Read from the 4-byte FONTID prefix the plain-text rendering skips. Only
+/// the attributes that survive into any sane rendering are exposed: colour,
+/// face and point size deliberately are not, because reproducing a font
+/// stack is presentation rather than evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+impl RunStyle {
+    /// Decode FONTIDFIELDS.Attrib.
+    pub fn from_attrib(attrib: u8) -> Self {
+        Self {
+            bold: attrib & 0x01 != 0,
+            italic: attrib & 0x02 != 0,
+            underline: attrib & 0x04 != 0,
+            strikethrough: attrib & 0x08 != 0,
+        }
+    }
+
+    pub fn is_plain(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// One run of body text with the emphasis it was written with.
+#[derive(Debug, Clone, Default)]
+pub struct BodyRun {
+    pub text: String,
+    pub style: RunStyle,
+    /// True when a paragraph boundary was recorded before this run.
+    pub paragraph_break_before: bool,
+}
+
 /// Decoded rich-text + attachments of a note's non-summary object.
 #[derive(Debug, Clone, Default)]
 pub struct NoteContent {
     /// Plain-text rendering of the CDTEXT runs (the rich-text body).
     pub body_text: String,
+    /// The same body as styled runs, in document order.
+    ///
+    /// `body_text` stays the flattened rendering every existing caller
+    /// expects; this is the structure it was flattened from, so a consumer
+    /// that can show emphasis does not have to re-walk the stream.
+    pub runs: Vec<BodyRun>,
     /// Embedded images and file attachments.
     pub attachments: Vec<Attachment>,
 }
@@ -204,17 +253,36 @@ pub fn parse(obj: &[u8]) -> NoteContent {
     let recs = walk(obj);
     let mut content = NoteContent::default();
 
-    // Body text: concatenate CDTEXT runs (4-byte font/style prefix, then LMBCS;
-    // we emit printable ASCII and treat NUL as a run separator).
-    for r in recs.iter().filter(|r| r.sig == SIG_TEXT) {
+    // Body text: concatenate CDTEXT runs (4-byte FONTID prefix, then LMBCS;
+    // we emit printable ASCII and treat NUL as a run separator). The FONTID
+    // prefix the flattened text skips carries the emphasis, so the same pass
+    // records the runs it was flattened from.
+    let mut pending_break = false;
+    for r in recs.iter().filter(|r| r.sig == SIG_TEXT || r.sig == SIG_PARAGRAPH) {
+        if r.sig == SIG_PARAGRAPH {
+            pending_break = true;
+            continue;
+        }
+        // FONTIDFIELDS: Face, Attrib, Color, PointSize.
+        let style = RunStyle::from_attrib(r.body.get(1).copied().unwrap_or(0));
         let text = r.body.get(4..).unwrap_or(&[]);
+        let mut run = String::new();
         for &b in text {
             match b {
-                0x09 | 0x0A | 0x0D | 0x20..=0x7E => content.body_text.push(b as char),
+                0x09 | 0x0A | 0x0D | 0x20..=0x7E => run.push(b as char),
                 _ => {}
             }
         }
+        content.body_text.push_str(&run);
         content.body_text.push('\n');
+        if !run.is_empty() {
+            content.runs.push(BodyRun {
+                text: run,
+                style,
+                paragraph_break_before: pending_break,
+            });
+            pending_break = false;
+        }
     }
     while content.body_text.ends_with('\n') {
         content.body_text.pop();
@@ -350,5 +418,98 @@ mod image_ext_tests {
         // magic alone would rename audio to an image extension.
         assert_eq!(image_ext_from_magic(b"RIFF____WEBPmore"), Some("webp"));
         assert_eq!(image_ext_from_magic(b"RIFF____WAVEfmt "), None);
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[test]
+    fn font_attributes_decode_to_the_emphasis_they_mean() {
+        assert!(RunStyle::from_attrib(0x00).is_plain());
+        assert!(RunStyle::from_attrib(0x01).bold);
+        assert!(RunStyle::from_attrib(0x02).italic);
+        assert!(RunStyle::from_attrib(0x04).underline);
+        assert!(RunStyle::from_attrib(0x08).strikethrough);
+        let both = RunStyle::from_attrib(0x03);
+        assert!(both.bold && both.italic && !both.underline);
+    }
+
+    /// Measure what the corpus actually carries, rather than assuming rich
+    /// text is rich. The number decides whether rendering emphasis is worth
+    /// anything on real evidence.
+    #[test]
+    #[ignore = "diagnostic: prints the CD signature histogram"]
+    fn corpus_signature_histogram() {
+        let root = std::env::var_os("NSF_CORPUS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(r"C:\SherlockForensics")
+                    .join(".scratch")
+                    .join("nsf-samples")
+            });
+        let path = root.join("real-nsf").join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut hist: std::collections::BTreeMap<u8, usize> = Default::default();
+        for n in en.notes.iter().take(4000) {
+            let Some(obj) = db.non_summary_data(n) else { continue };
+            for r in walk(&obj) {
+                *hist.entry(r.sig).or_default() += 1;
+            }
+        }
+        for (sig, n) in &hist {
+            eprintln!("  sig 0x{sig:02X}  {n}");
+        }
+    }
+
+    #[test]
+    fn corpus_bodies_decompose_into_runs() {
+        let root = std::env::var_os("NSF_CORPUS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(r"C:\SherlockForensics")
+                    .join(".scratch")
+                    .join("nsf-samples")
+            });
+        let path = root.join("real-nsf").join("fakenames.nsf");
+        if !path.is_file() {
+            eprintln!("corpus not present; skipping");
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut notes_with_body = 0usize;
+        let mut runs = 0usize;
+        let mut styled = 0usize;
+        let mut breaks = 0usize;
+        for n in en.notes.iter().take(4000) {
+            let Some(c) = db.note_content(n) else { continue };
+            if c.runs.is_empty() {
+                continue;
+            }
+            notes_with_body += 1;
+            runs += c.runs.len();
+            styled += c.runs.iter().filter(|r| !r.style.is_plain()).count();
+            breaks += c.runs.iter().filter(|r| r.paragraph_break_before).count();
+            // The flattened text must still contain every run's text, or the
+            // two renderings disagree about what the body says.
+            for r in &c.runs {
+                assert!(
+                    c.body_text.contains(r.text.trim_end_matches('\n')) || r.text.trim().is_empty(),
+                    "run text missing from the flattened body"
+                );
+            }
+        }
+        eprintln!(
+            "corpus bodies: {notes_with_body} notes, {runs} runs, {styled} styled, {breaks} paragraph breaks"
+        );
+        assert!(notes_with_body > 0, "the corpus should hold rich-text bodies");
     }
 }

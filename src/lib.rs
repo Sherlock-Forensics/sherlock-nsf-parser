@@ -74,7 +74,7 @@ pub mod superblock;
 pub mod time;
 
 pub use bdb::{BucketDescriptorBlock, RrvBucketDescriptor, RrvBucketKind};
-pub use cd::{Attachment, AttachmentKind, NoteContent};
+pub use cd::{Attachment, AttachmentKind, BodyRun, NoteContent, RunStyle};
 pub use bdt::BucketDescriptorTable;
 pub use bucket::{Bucket, BucketHeader, BucketSlot};
 pub use database::{
