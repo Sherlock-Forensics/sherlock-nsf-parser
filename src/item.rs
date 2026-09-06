@@ -135,6 +135,57 @@ pub struct NoteItem<'a> {
 }
 
 impl<'a> NoteItem<'a> {
+    /// Decode a TYPE_TEXT_LIST value into its individual entries.
+    ///
+    /// On-disk layout, validated against the corpus: a `u16` entry count,
+    /// then one `u16` byte-length per entry, then every entry's text
+    /// concatenated with no separator between them. A `$UpdatedBy` value of
+    /// 66 bytes decodes as count 2, lengths 33 and 27, giving
+    /// `["CN=Karsten Lehmann/O=Haus Weilgut", "CN=Karsten Lehmann/O=Mindoo"]`.
+    ///
+    /// Returns `None` unless the header and lengths account for the value
+    /// byte-for-byte. That exact-fit requirement is the validation: entries
+    /// run together with no delimiter, so a wrong count or length would
+    /// silently split names mid-word rather than fail, and a recipient list
+    /// chopped into fragments is worse than one left undecoded.
+    ///
+    /// [`Self::as_text`] flattens the same bytes into a single string with
+    /// the binary prefix rendered as `.`, which is why it cannot be used to
+    /// recover a recipient list.
+    pub fn as_text_list(&self) -> Option<Vec<String>> {
+        let v = self.value;
+        if v.len() < 4 {
+            return None;
+        }
+        let count = u16::from_le_bytes([v[0], v[1]]) as usize;
+        if count == 0 {
+            return None;
+        }
+        let header = 2usize.checked_add(count.checked_mul(2)?)?;
+        if header > v.len() {
+            return None;
+        }
+        let mut lens = Vec::with_capacity(count);
+        let mut sum = 0usize;
+        for k in 0..count {
+            let o = 2 + k * 2;
+            let l = u16::from_le_bytes([v[o], v[o + 1]]) as usize;
+            sum = sum.checked_add(l)?;
+            lens.push(l);
+        }
+        if header.checked_add(sum)? != v.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        let mut off = header;
+        for l in lens {
+            let end = off + l;
+            out.push(String::from_utf8_lossy(&v[off..end]).into_owned());
+            off = end;
+        }
+        Some(out)
+    }
+
     /// Best-effort text rendering of the value: runs of printable ASCII are
     /// kept, other bytes become `.`. Lotus text items (the common case for
     /// names, addresses, e-mail) render cleanly; binary values (numbers,
@@ -239,6 +290,13 @@ impl NoteItem<'_> {
             return String::new();
         }
         match kind {
+            // A TEXT_LIST decodes to its entries when the on-disk lengths fit
+            // exactly; joining with "; " keeps a multi-recipient field
+            // readable instead of running the names together. Falls through
+            // to the flat rendering when the value is not a well-formed list.
+            FieldKind::TextList if self.as_text_list().is_some() => {
+                self.as_text_list().unwrap_or_default().join("; ")
+            }
             FieldKind::Text
             | FieldKind::TextList
             | FieldKind::Rfc822Text
@@ -396,5 +454,97 @@ mod tests {
         assert_eq!(items[1].display_value(), ""); // type-word placeholder
         assert_eq!(items[2].display_value(), "42");
         assert_eq!(items[3].display_value(), "99 99 99 99 99 99");
+    }
+}
+
+#[cfg(test)]
+mod text_list_tests {
+    use super::*;
+
+    fn item(value: &[u8]) -> NoteItem<'_> {
+        NoteItem { name_id: 0, type_flags: 0, value }
+    }
+
+    /// Build a well-formed TEXT_LIST value from entries.
+    fn encode(entries: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for e in entries {
+            v.extend_from_slice(&(e.len() as u16).to_le_bytes());
+        }
+        for e in entries {
+            v.extend_from_slice(e.as_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn decodes_the_corpus_shape() {
+        // Byte-for-byte the $UpdatedBy value observed in fakenames.nsf:
+        // count 2, lengths 33 and 27.
+        let v = encode(&[
+            "CN=Karsten Lehmann/O=Haus Weilgut",
+            "CN=Karsten Lehmann/O=Mindoo",
+        ]);
+        assert_eq!(v.len(), 66, "corpus value was 66 bytes");
+        assert_eq!(v[0..2], [0x02, 0x00]);
+        assert_eq!(v[2..4], [0x21, 0x00]);
+        assert_eq!(v[4..6], [0x1B, 0x00]);
+        let got = item(&v).as_text_list().expect("must decode");
+        assert_eq!(
+            got,
+            vec![
+                "CN=Karsten Lehmann/O=Haus Weilgut".to_string(),
+                "CN=Karsten Lehmann/O=Mindoo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn single_entry_list_decodes() {
+        let v = encode(&["CN=Alice/O=Acme"]);
+        assert_eq!(item(&v).as_text_list().unwrap(), vec!["CN=Alice/O=Acme"]);
+    }
+
+    #[test]
+    fn rejects_anything_that_does_not_fit_exactly() {
+        // Entries run together with no delimiter, so a length that is wrong
+        // by one would split a name mid-word and still look plausible. Only
+        // an exact fit is accepted.
+        let mut v = encode(&["alice", "bob"]);
+        v.push(b'X'); // one trailing byte the lengths do not account for
+        assert!(item(&v).as_text_list().is_none());
+
+        let mut short = encode(&["alice", "bob"]);
+        short.pop();
+        assert!(item(&short).as_text_list().is_none());
+    }
+
+    #[test]
+    fn rejects_degenerate_headers() {
+        assert!(item(&[]).as_text_list().is_none());
+        assert!(item(&[0x01, 0x00]).as_text_list().is_none());
+        // Count of zero is not a list.
+        assert!(item(&[0x00, 0x00, 0x00, 0x00]).as_text_list().is_none());
+        // A count large enough to overflow the header arithmetic must not panic.
+        assert!(item(&[0xFF, 0xFF, 0x00, 0x00]).as_text_list().is_none());
+    }
+
+    #[test]
+    fn render_joins_list_entries_readably() {
+        let v = encode(&["CN=Alice/O=Acme", "CN=Bob/O=Acme"]);
+        assert_eq!(
+            item(&v).render(FieldKind::TextList),
+            "CN=Alice/O=Acme; CN=Bob/O=Acme"
+        );
+    }
+
+    #[test]
+    fn render_falls_back_when_the_value_is_not_a_well_formed_list() {
+        // Plain text mistyped as a list must still render as text rather
+        // than vanish.
+        let v = b"plain text value";
+        let out = item(v).render(FieldKind::TextList);
+        assert_eq!(out, "plain text value");
     }
 }
