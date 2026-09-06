@@ -100,8 +100,15 @@ pub enum AttachmentKind {
 pub struct Attachment {
     /// File name (from CDFILEHEADER) or a synthesized `image_N.ext`.
     pub name: String,
-    /// Reassembled bytes. May be empty for file variants whose segment
-    /// encoding is not yet decoded (the name is still recovered).
+    /// Reassembled bytes.
+    ///
+    /// Empty when the CD stream names a file but carries none of it. That
+    /// is not a decoding failure: measured on fakenames.nsf, those notes'
+    /// CDFILESEGMENT records have zero-length bodies, so the bytes are not
+    /// in the rich-text stream at all - Notes keeps the attachment in a
+    /// separate file object, which this build does not yet resolve. A
+    /// consumer must report such an attachment as PRESENT WITH NO CONTENT
+    /// RECOVERED, never as an empty file.
     pub data: Vec<u8>,
     /// Image vs file.
     pub kind: AttachmentKind,
@@ -466,6 +473,50 @@ mod run_tests {
         for (sig, n) in &hist {
             eprintln!("  sig 0x{sig:02X}  {n}");
         }
+    }
+
+    /// Pin the measured shape of a name-only attachment, so the doc claim
+    /// above cannot drift back to "an encoding we cannot decode".
+    #[test]
+    fn a_file_segment_with_no_body_yields_a_named_attachment_with_no_bytes() {
+        // A CD stream with a file header and an EMPTY segment, which is what
+        // fakenames.nsf actually carries for six attachments.
+        let mut obj = vec![0u8; CD_STREAM_START];
+        // CDFILEHEADER, BSIG framing: [sig][len][body...]
+        let name = b"report.bin";
+        let mut header_body = vec![0u8; 8];
+        header_body.extend_from_slice(name);
+        obj.push(SIG_FILEHEADER);
+        obj.push((2 + header_body.len()) as u8);
+        obj.extend_from_slice(&header_body);
+        // CDFILESEGMENT with a zero-length body.
+        obj.push(SIG_FILESEGMENT);
+        obj.push(2);
+
+        let content = parse(&obj);
+        assert_eq!(content.attachments.len(), 1);
+        let a = &content.attachments[0];
+        assert_eq!(a.name, "report.bin");
+        assert!(a.data.is_empty(), "there were no bytes to recover");
+        assert_eq!(a.kind, AttachmentKind::File);
+    }
+
+    #[test]
+    fn a_file_segment_with_a_body_recovers_its_bytes() {
+        let mut obj = vec![0u8; CD_STREAM_START];
+        let mut header_body = vec![0u8; 8];
+        header_body.extend_from_slice(b"note.txt");
+        obj.push(SIG_FILEHEADER);
+        obj.push((2 + header_body.len()) as u8);
+        obj.extend_from_slice(&header_body);
+        let payload = b"hello world";
+        obj.push(SIG_FILESEGMENT);
+        obj.push((2 + payload.len()) as u8);
+        obj.extend_from_slice(payload);
+
+        let content = parse(&obj);
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(content.attachments[0].data, payload.to_vec());
     }
 
     #[test]
