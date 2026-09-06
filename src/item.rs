@@ -594,7 +594,353 @@ mod tests {
     }
 }
 
+/// # Where the overflow values are NOT
+///
+/// When an item walk stops, the values it could not read are somewhere.
+/// These diagnostics (all ignored by default; run with
+/// `cargo test -- --ignored --nocapture`) record what has been RULED OUT,
+/// so the next attempt does not repeat it:
+///
+/// - `diagnose_overflow_is_the_non_summary_object`: the first unreached
+///   item's declared size equals the non-summary object's payload for only
+///   42 of 617 incomplete notes. Not a general rule.
+/// - `diagnose_declared_vs_record_size`: with a 100-byte header the declared
+///   totals exceed the record by 2-25x; with a 64-byte header they are
+///   nonsense (~68KB). The descriptor table really does start at 100, and
+///   the record really is too small for what it declares.
+/// - `diagnose_values_span_record_then_object`: the record tail plus the
+///   object payload SIZES the gap almost exactly - 595 of 617 notes come out
+///   8 to 11 bytes over. Arithmetically compelling.
+/// - `diagnose_which_overflow_layout_decodes`: and it is still wrong.
+///   Walking the unreached descriptors against that concatenation, and
+///   against the object at offsets 0 and 68, decodes ZERO TEXT_LIST values.
+///   A TEXT_LIST is a strict oracle: its internal lengths must account for
+///   the value byte for byte, so a correct offset would decode and a wrong
+///   one cannot. The size arithmetic matching was a coincidence.
+///
+/// The values' location remains unknown. Nothing here guesses at it.
 #[cfg(test)]
+mod overflow_diagnostics {
+    use super::*;
+    /// Which concatenation recovers real values? A TEXT_LIST value only
+    /// decodes when its internal lengths account for the bytes exactly, so
+    /// $UpdatedBy is an oracle: if the offset is wrong, it will not decode.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_which_overflow_layout_decodes() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let bdb = db.bucket_descriptor_block().expect("bdb").expect("bdb");
+        // Try several starts for the object's value region.
+        let mut wins: std::collections::BTreeMap<String, usize> = Default::default();
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            if !w.incomplete() {
+                continue;
+            }
+            let Some(obj) = db.non_summary_data(n) else { continue };
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let count = n.header.number_of_note_items as usize;
+            let table_end = NOTE_HEADER_BYTES + count * ITEM_DESCRIPTOR_BYTES;
+            let mut consumed = table_end;
+            for k in 0..w.items.len() {
+                let d = NOTE_HEADER_BYTES + k * ITEM_DESCRIPTOR_BYTES;
+                consumed += u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+            }
+            for (label, buf) in [
+                ("tail+obj68", {
+                    let mut v = rec[consumed.min(rec.len())..].to_vec();
+                    v.extend_from_slice(obj.get(68..).unwrap_or(&[]));
+                    v
+                }),
+                ("obj68", obj.get(68..).unwrap_or(&[]).to_vec()),
+                ("obj0", obj.to_vec()),
+            ] {
+                // Walk the unreached descriptors against this buffer and see
+                // whether any TEXT_LIST field decodes exactly.
+                let mut off = 0usize;
+                let mut decoded = 0usize;
+                for k in w.items.len()..count {
+                    let d = NOTE_HEADER_BYTES + k * ITEM_DESCRIPTOR_BYTES;
+                    if d + 8 > rec.len() {
+                        break;
+                    }
+                    let id = u16::from_le_bytes([rec[d], rec[d + 1]]);
+                    let sz = u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+                    let Some(val) = buf.get(off..off + sz) else { break };
+                    off += sz;
+                    if bdb.field_kind(id) == FieldKind::TextList {
+                        let it = NoteItem { name_id: id, type_flags: 0, value: val };
+                        if it.as_text_list().is_some() {
+                            decoded += 1;
+                        }
+                    }
+                }
+                if decoded > 0 {
+                    *wins.entry(label.to_string()).or_default() += decoded;
+                }
+            }
+        }
+        eprintln!("TEXT_LIST decodes by layout: {wins:?}");
+    }
+
+    /// Precise test: are the values packed across the record AND then the
+    /// non-summary payload, contiguously?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_values_span_record_then_object() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let (mut exact, mut over, mut under) = (0usize, 0usize, 0usize);
+        let mut excess: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut shown = 0;
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            if !w.incomplete() {
+                continue;
+            }
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let count = n.header.number_of_note_items as usize;
+            let table_end = NOTE_HEADER_BYTES + count * ITEM_DESCRIPTOR_BYTES;
+            let mut consumed = table_end;
+            let mut declared_total = 0usize;
+            for k in 0..count {
+                let d = NOTE_HEADER_BYTES + k * ITEM_DESCRIPTOR_BYTES;
+                if d + 8 > rec.len() {
+                    break;
+                }
+                let sz = u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+                declared_total += sz;
+                if k < w.items.len() {
+                    consumed += sz;
+                }
+            }
+            let leftover = rec.len().saturating_sub(consumed);
+            let ns_payload = (n.header.non_summary_data_size as usize).saturating_sub(68);
+            let available = leftover + ns_payload;
+            let needed = declared_total
+                - (consumed - table_end); // what the recovered items already took
+            match available.cmp(&needed) {
+                std::cmp::Ordering::Equal => exact += 1,
+                std::cmp::Ordering::Greater => {
+                    over += 1;
+                    *excess.entry(available - needed).or_default() += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    under += 1;
+                    if shown < 5 {
+                        shown += 1;
+                        eprintln!(
+                            "   note 0x{:08X} needed {needed} available {available} (leftover {leftover} + ns {ns_payload})",
+                            n.rrv_identifier
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("SPAN TEST: {exact} exact, {over} more available than needed, {under} short");
+        let mut v: Vec<_> = excess.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("   excess bytes, most common:");
+        for (e, n) in v.iter().take(10) {
+            eprintln!("      {e:>8} bytes  {n} notes");
+        }
+    }
+
+    /// Does the sum of the UNREACHED declared sizes match the non-summary
+    /// object's payload? If the overflow values live there, it should.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_unreached_sum_vs_non_summary() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut hist: std::collections::BTreeMap<i64, usize> = Default::default();
+        let mut shown = 0;
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            if !w.incomplete() {
+                continue;
+            }
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let count = n.header.number_of_note_items as usize;
+            let mut unreached_sum = 0usize;
+            for k in w.items.len()..count {
+                let d = NOTE_HEADER_BYTES + k * ITEM_DESCRIPTOR_BYTES;
+                if d + 8 > rec.len() {
+                    break;
+                }
+                unreached_sum += u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+            }
+            let ns_payload = (n.header.non_summary_data_size as usize).saturating_sub(68);
+            let diff = ns_payload as i64 - unreached_sum as i64;
+            *hist.entry(diff).or_default() += 1;
+            if diff != 0 && shown < 5 {
+                shown += 1;
+                eprintln!(
+                    "   note 0x{:08X} unreached_sum {unreached_sum} ns_payload {ns_payload} diff {diff}",
+                    n.rrv_identifier
+                );
+            }
+        }
+        let mut v: Vec<_> = hist.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("UNREACHED SUM vs NS PAYLOAD, most common diffs:");
+        for (d, n) in v.into_iter().take(8) {
+            eprintln!("   diff {d:>8}  {n} notes");
+        }
+    }
+
+    /// How far off is the record from holding everything it declares?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_declared_vs_record_size() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let mut shown = 0;
+        let (mut fits_at_64, mut fits_at_100, mut neither) = (0, 0, 0);
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            if !w.incomplete() {
+                continue;
+            }
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let count = n.header.number_of_note_items as usize;
+            let mut fit = |base: usize| -> Option<usize> {
+                let table_end = base + count * ITEM_DESCRIPTOR_BYTES;
+                if rec.len() < table_end {
+                    return None;
+                }
+                let mut sum = table_end;
+                for k in 0..count {
+                    let d = base + k * ITEM_DESCRIPTOR_BYTES;
+                    sum += u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+                }
+                Some(sum)
+            };
+            let at100 = fit(100);
+            let at64 = fit(64);
+            match (at64, at100) {
+                (Some(a), _) if a == rec.len() => fits_at_64 += 1,
+                (_, Some(b)) if b == rec.len() => fits_at_100 += 1,
+                _ => {
+                    neither += 1;
+                    if shown < 6 {
+                        shown += 1;
+                        eprintln!(
+                            "   note 0x{:08X} rec {} items {} needs@100 {:?} needs@64 {:?}",
+                            n.rrv_identifier,
+                            rec.len(),
+                            count,
+                            at100,
+                            at64
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("SIZE FIT: {fits_at_64} fit with a 64-byte header, {fits_at_100} with 100, {neither} neither");
+    }
+
+    /// Test one hypothesis: when the walk stops, is the first unreached
+    /// item's declared value size exactly the non-summary object's payload
+    /// (its size minus the 68-byte object header)?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diagnose_overflow_is_the_non_summary_object() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+        let (mut tested, mut exact, mut nonsummary_zero, mut other) = (0, 0, 0, 0);
+        let mut examples = 0;
+        for n in &en.notes {
+            let w = db.note_items_walk(n);
+            if !w.incomplete() {
+                continue;
+            }
+            let start = n.file_offset as usize;
+            let end = (start + n.header.size as usize).min(bytes.len());
+            let rec = &bytes[start..end];
+            let idx = w.items.len();
+            let d = NOTE_HEADER_BYTES + idx * ITEM_DESCRIPTOR_BYTES;
+            if d + 8 > rec.len() {
+                continue;
+            }
+            let declared = u16::from_le_bytes([rec[d + 4], rec[d + 5]]) as usize;
+            let ns = n.header.non_summary_data_size as usize;
+            tested += 1;
+            if ns == 0 {
+                nonsummary_zero += 1;
+            } else if declared + 68 == ns {
+                exact += 1;
+            } else {
+                other += 1;
+                if examples < 6 {
+                    examples += 1;
+                    eprintln!(
+                        "   note 0x{:08X} declared {declared} nonsummary {ns} diff {}",
+                        n.rrv_identifier,
+                        ns as i64 - declared as i64
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "OVERFLOW HYPOTHESIS: {tested} incomplete notes; {exact} match declared+68==nonsummary; {nonsummary_zero} have no non-summary object; {other} neither"
+        );
+    }
+
     /// What KIND of field is going unread? If they are the rich-text and
     /// attachment fields, their values legitimately live in the note's
     /// non-summary object, which this tool already reads separately - and
@@ -702,6 +1048,9 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
 mod text_list_tests {
     use super::*;
 
