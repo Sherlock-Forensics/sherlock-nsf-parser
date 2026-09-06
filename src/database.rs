@@ -424,10 +424,29 @@ impl<'a> Database<'a> {
     pub fn enumerate_notes(&self) -> Result<NoteEnumeration, NsfError> {
         let mut out = NoteEnumeration::default();
 
-        let Some((_, sb)) = self.freshest_superblock()? else {
-            return Ok(out);
+        // RRV bucket size: superblock copy preferred, DBINFO as the fallback.
+        //
+        // The freshest superblock's `rrv_bucket_size` is 0 in a real slice of
+        // databases (ToDo.nsf, notebook12_EN.ntf and teamrm12_EN.ntf in the
+        // corpus) even though DBINFO names a valid 4096 and the RRV buckets
+        // are plainly present - 63, 157 and 495 non-data RRV entries
+        // respectively. Trusting the superblock copy alone returned zero
+        // notes for every such database, which the viewer then presented as
+        // an unreadable file.
+        //
+        // A missing superblock is likewise no longer fatal. The bucket
+        // offsets come from the BDB and the two DBINFO pointers below, never
+        // from the superblock, so its size field is the only thing wanted
+        // here and DBINFO carries that too.
+        let sb_size = self
+            .freshest_superblock()?
+            .map(|(_, sb)| sb.rrv_bucket_size as usize)
+            .unwrap_or(0);
+        let rrv_bucket_size = if sb_size != 0 {
+            sb_size
+        } else {
+            self.header.rrv_bucket_size as usize
         };
-        let rrv_bucket_size = sb.rrv_bucket_size as usize;
         if rrv_bucket_size == 0 {
             return Ok(out);
         }

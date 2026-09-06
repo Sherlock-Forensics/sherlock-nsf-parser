@@ -619,3 +619,62 @@ fn corpus_covers_multiple_ods_versions() {
     // little-endian path equivalently for v0.1.
     assert!(seen_ods.len() >= 2, "expected at least 2 distinct ODS versions");
 }
+
+#[test]
+fn zero_superblock_rrv_bucket_size_falls_back_to_dbinfo() {
+    // Regression: enumerate_notes read rrv_bucket_size from the freshest
+    // superblock only, and returned an empty enumeration when that copy was
+    // zero. It is zero in these three databases even though DBINFO carries a
+    // valid 4096 and the RRV buckets are populated, so all three enumerated
+    // as unreadable while the data sat right there. Guarded here because the
+    // symptom - an empty note list - looks identical to a genuinely empty
+    // database, which is exactly how it survived unnoticed.
+    let Some(root) = corpus_root() else {
+        eprintln!("corpus not present; skipping");
+        return;
+    };
+    let cases = [
+        ("real-nsf", "ToDo.nsf"),
+        ("hcl-templates-en", "notebook12_EN.ntf"),
+        ("hcl-templates-en", "teamrm12_EN.ntf"),
+    ];
+    let mut checked = 0;
+    for (sub, name) in cases {
+        let path = root.join(sub).join(name);
+        if !path.is_file() {
+            eprintln!("{name} not present; skipping");
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        let db = Database::open(&bytes).unwrap_or_else(|e| panic!("open {name}: {e:?}"));
+
+        // The precondition that made the bug reachable. If a future corpus
+        // refresh changes this, the case stops testing what it claims to.
+        let sb_size = db
+            .freshest_superblock()
+            .expect("freshest superblock")
+            .map(|(_, sb)| sb.rrv_bucket_size)
+            .unwrap_or(0);
+        assert_eq!(sb_size, 0, "{name}: expected a zero superblock rrv_bucket_size");
+        assert_ne!(
+            db.header().rrv_bucket_size,
+            0,
+            "{name}: DBINFO must carry the fallback size"
+        );
+
+        let e = db.enumerate_notes().unwrap_or_else(|e| panic!("enumerate {name}: {e:?}"));
+        eprintln!("{name}: {} notes, {} unresolved", e.notes.len(), e.unresolved);
+        assert!(
+            !e.notes.is_empty(),
+            "{name} enumerated 0 notes; the DBINFO rrv_bucket_size fallback regressed"
+        );
+        for n in &e.notes {
+            assert_eq!(
+                n.header.rrv_identifier, n.rrv_identifier,
+                "{name}: record failed the identity gate"
+            );
+        }
+        checked += 1;
+    }
+    eprintln!("zero-superblock fallback verified on {checked} databases");
+}
