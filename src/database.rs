@@ -765,6 +765,7 @@ impl<'a> Database<'a> {
                     record_len: 0,
                 },
                 unreached_name_ids: Vec::new(),
+                unreached: Vec::new(),
             };
         };
         crate::item::walk_items(record, note.header.number_of_note_items)

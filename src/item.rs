@@ -402,6 +402,10 @@ pub struct ItemWalk<'a> {
     /// fields are missing", which is the difference between an alarm and a
     /// finding.
     pub unreached_name_ids: Vec<u16>,
+    /// The same items, each with its field flags and what they say about why
+    /// it was not reached. `unreached_name_ids` stays as the bare list for
+    /// callers that only want to name them.
+    pub unreached: Vec<UnreachedItem>,
 }
 
 impl ItemWalk<'_> {
@@ -429,6 +433,7 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
                 record_len: record.len(),
             },
             unreached_name_ids: Vec::new(),
+            unreached: Vec::new(),
         };
     }
     let mut items = Vec::with_capacity(count);
@@ -454,18 +459,104 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
             value,
         });
     }
-    let unreached_name_ids = (items.len()..count)
-        .filter_map(|i| {
-            let d = NOTE_HEADER_BYTES + i * ITEM_DESCRIPTOR_BYTES;
-            Some(u16::from_le_bytes([*record.get(d)?, *record.get(d + 1)?]))
-        })
-        .collect();
+    let mut unreached_name_ids = Vec::new();
+    let mut unreached = Vec::new();
+    for i in items.len()..count {
+        let d = NOTE_HEADER_BYTES + i * ITEM_DESCRIPTOR_BYTES;
+        let (Some(a), Some(b)) = (record.get(d), record.get(d + 1)) else {
+            break;
+        };
+        let name_id = u16::from_le_bytes([*a, *b]);
+        // The descriptor table is fixed-width, so an item's flags are still
+        // readable even where the walk could not reach its value.
+        let flags = match (record.get(d + 2), record.get(d + 3)) {
+            (Some(x), Some(y)) => u16::from_le_bytes([*x, *y]),
+            _ => 0,
+        };
+        unreached_name_ids.push(name_id);
+        unreached.push(UnreachedItem {
+            name_id,
+            flags,
+            reason: UnreachedReason::classify(flags),
+        });
+    }
     ItemWalk {
         items,
         claimed: number_of_note_items,
         stop,
         unreached_name_ids,
+        unreached,
     }
+}
+
+/// Field flag: the value is stored in the note data rather than in the
+/// non-summary data. Its absence means the value was never in this record to
+/// be found.
+pub const ITEM_SUMMARY: u16 = 0x0004;
+
+/// Field flag: name the item in the item table, but store no value for it.
+pub const ITEM_PLACEHOLDER: u16 = 0x0100;
+
+/// Why a declared item was not recovered from the record.
+///
+/// This distinction exists because the previous answer - a single count of
+/// "fields that went unread" - alarmed examiners about the ordinary case.
+/// Measured across the corpus, roughly three quarters of unreached items are
+/// items that by definition have no value in the record: a placeholder stores
+/// nothing, and a non-summary item's value lives in the non-summary object.
+/// Reporting those as potentially-missed evidence overstates the problem and
+/// buries the quarter that is real.
+///
+/// Flag meanings are from the libyal NSF format documentation. This build
+/// reads the flags; it does not yet follow a non-summary item to its value,
+/// which is why [`UnreachedReason::ValueInNonSummary`] says where the value is
+/// rather than claiming to have read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreachedReason {
+    /// `ITEM_PLACEHOLDER` set. No value was ever stored. Expected, not a gap.
+    NoValueStored,
+    /// `ITEM_SUMMARY` clear: the value lives in the non-summary object rather
+    /// than in this record. Expected to be absent here.
+    ValueInNonSummary,
+    /// A summary item that should have been in the record and was not. The
+    /// only one of the three that means recoverable data went unrecovered.
+    Unexplained,
+}
+
+impl UnreachedReason {
+    pub fn classify(flags: u16) -> Self {
+        if flags & ITEM_PLACEHOLDER != 0 {
+            UnreachedReason::NoValueStored
+        } else if flags & ITEM_SUMMARY == 0 {
+            UnreachedReason::ValueInNonSummary
+        } else {
+            UnreachedReason::Unexplained
+        }
+    }
+
+    /// True when the item's absence from the record is expected rather than a
+    /// shortfall in what this build recovered.
+    pub fn is_expected(self) -> bool {
+        !matches!(self, UnreachedReason::Unexplained)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UnreachedReason::NoValueStored => "no value stored",
+            UnreachedReason::ValueInNonSummary => "value is in the non-summary object",
+            UnreachedReason::Unexplained => "unexplained",
+        }
+    }
+}
+
+/// One declared item the walk did not reach, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnreachedItem {
+    pub name_id: u16,
+    /// Raw field flags from the descriptor, kept so a reader is never left
+    /// taking this build's classification on trust.
+    pub flags: u16,
+    pub reason: UnreachedReason,
 }
 
 #[cfg(test)]
@@ -1383,5 +1474,96 @@ mod text_list_tests {
         let v = b"plain text value";
         let out = item(v).render(FieldKind::TextList);
         assert_eq!(out, "plain text value");
+    }
+}
+
+#[cfg(test)]
+mod unreached_classification_tests {
+    use super::*;
+
+    #[test]
+    fn a_placeholder_stores_no_value_and_that_is_expected() {
+        let r = UnreachedReason::classify(ITEM_PLACEHOLDER);
+        assert_eq!(r, UnreachedReason::NoValueStored);
+        assert!(r.is_expected(), "a placeholder is not a coverage gap");
+    }
+
+    #[test]
+    fn a_non_summary_item_keeps_its_value_elsewhere_and_that_is_expected() {
+        let r = UnreachedReason::classify(0x0009);
+        assert_eq!(r, UnreachedReason::ValueInNonSummary);
+        assert!(r.is_expected());
+    }
+
+    /// The only case that means recoverable data went unrecovered. If this
+    /// ever starts reading as expected, the tool stops reporting a real gap.
+    #[test]
+    fn a_summary_item_that_is_missing_is_unexplained_and_is_not_expected() {
+        let r = UnreachedReason::classify(ITEM_SUMMARY);
+        assert_eq!(r, UnreachedReason::Unexplained);
+        assert!(!r.is_expected(), "this one must keep its warning");
+    }
+
+    /// Placeholder wins over the summary bit: an item that stores nothing has
+    /// no value wherever its other flags point.
+    #[test]
+    fn placeholder_takes_precedence_over_the_summary_bit() {
+        assert_eq!(
+            UnreachedReason::classify(ITEM_PLACEHOLDER | ITEM_SUMMARY),
+            UnreachedReason::NoValueStored
+        );
+    }
+}
+
+#[cfg(test)]
+mod unreached_corpus_tests {
+    use super::*;
+
+    /// The measurement behind the correction, pinned so it cannot drift back.
+    ///
+    /// Before this classification the tool reported every unreached item as a
+    /// field that went unread, implying evidence might have been missed. Most
+    /// of them are items that by definition have no value in the record. The
+    /// assertion is deliberately a proportion rather than exact counts: the
+    /// claim being defended is "the majority are expected", not a number that
+    /// would have to be re-baselined whenever the corpus changes.
+    #[test]
+    fn most_unreached_items_are_expected_absences_not_coverage_gaps() {
+        let path = std::path::PathBuf::from(r"C:\SherlockForensics")
+            .join(".scratch")
+            .join("nsf-samples")
+            .join("real-nsf")
+            .join("fakenames.nsf");
+        if !path.is_file() {
+            eprintln!("corpus not present; skipping");
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read");
+        let db = crate::Database::open(&bytes).expect("open");
+        let en = db.enumerate_notes().expect("enumerate");
+
+        let (mut expected, mut unexplained) = (0usize, 0usize);
+        for n in &en.notes {
+            for u in db.note_items_walk(n).unreached {
+                if u.reason.is_expected() {
+                    expected += 1;
+                } else {
+                    unexplained += 1;
+                }
+            }
+        }
+        let total = expected + unexplained;
+        assert!(total > 1_000, "corpus should have plenty to classify: {total}");
+        assert!(
+            expected > unexplained,
+            "the majority must be expected absences: {expected} expected vs {unexplained} unexplained"
+        );
+        // And the real gap must not be classified out of existence - the
+        // point of the correction is to make it visible, not to hide it.
+        assert!(
+            unexplained > 0,
+            "a genuine unexplained remainder still exists and must keep its warning"
+        );
+        eprintln!("unreached: {expected} expected, {unexplained} unexplained, {total} total");
     }
 }
