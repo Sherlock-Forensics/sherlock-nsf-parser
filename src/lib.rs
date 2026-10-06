@@ -75,7 +75,7 @@ pub mod time;
 
 pub use bdb::{BucketDescriptorBlock, RrvBucketDescriptor, RrvBucketKind};
 pub use cd::{Attachment, AttachmentKind, BodyRun, NoteContent, RunStyle};
-pub use item::{ItemWalk, ItemWalkStop};
+pub use item::{ItemWalk, ItemWalkStop, UnreachedItem, UnreachedReason};
 pub use database::NonNoteRecord;
 pub use bdt::BucketDescriptorTable;
 pub use bucket::{Bucket, BucketHeader, BucketSlot};
