@@ -233,11 +233,41 @@ impl DbHeader {
         })
     }
 
+    /// True when DBINFO's file positions are plain byte offsets rather than
+    /// counts of 256-byte pages.
+    ///
+    /// Established on a real Notes 4 (ODS 20) mail file, from its own
+    /// header: `file_size` read as bytes was exactly the 275,841,024 bytes on
+    /// disk, and the data RRV, non-data RRV and BDB positions were all
+    /// inside the file as bytes and all past its end as pages. Every
+    /// ODS 43+ file in the corpus counts pages. ODS 41 (Notes 5) has not
+    /// been seen; it is grouped with the later formats because Notes 5 is
+    /// where the on-disk structure was redesigned.
+    pub fn uses_byte_positions(&self) -> bool {
+        self.ods.raw < 41
+    }
+
+    /// Byte offset for a DBINFO file position, in whichever unit this ODS
+    /// stores it.
+    pub fn position_bytes(&self, position: u32) -> u64 {
+        if self.uses_byte_positions() {
+            u64::from(position)
+        } else {
+            u64::from(position) * 256
+        }
+    }
+
     /// True if the database is flagged as a template (.ntf semantics).
     /// Verified empirically against the corpus: set on every .ntf,
     /// clear on every .nsf.
+    ///
+    /// Never true for a byte-position (pre-Notes 5) database. The bit was
+    /// only ever verified on ODS 43+, and the first ODS 20 file seen has it
+    /// set on a user mail file (class 0xFF01) holding tens of thousands of
+    /// notes; calling that "design-only, no documents" was the visible half
+    /// of that customer's failure.
     pub fn is_template(&self) -> bool {
-        self.database_flags & flags::DBFLAG_TEMPLATE != 0
+        !self.uses_byte_positions() && self.database_flags & flags::DBFLAG_TEMPLATE != 0
     }
 
     /// Encryption detection: NOT IMPLEMENTED in v0.1.
@@ -255,10 +285,11 @@ impl DbHeader {
         None
     }
 
-    /// Convenience: file-size estimate from the header's
-    /// 256-byte-increment field. Multiply by 256.
+    /// Convenience: file-size estimate from the header's file-size field,
+    /// in whichever unit this ODS stores it (see
+    /// [`Self::uses_byte_positions`]).
     pub fn file_size_from_header_bytes(&self) -> u64 {
-        (self.file_size_pages as u64) * 256
+        self.position_bytes(self.file_size_pages)
     }
 }
 

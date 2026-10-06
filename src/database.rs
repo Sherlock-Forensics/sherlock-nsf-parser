@@ -12,7 +12,7 @@ use crate::error::NsfError;
 use crate::header::DbHeader;
 use crate::info2::{Information2, INFO2_BYTES, INFO2_FILE_OFFSET};
 use crate::note::NoteHeader;
-use crate::rrv::{RrvBucketHeader, RrvEntry, RrvIter, RrvLocation};
+use crate::rrv::{LegacyRrvBucket, RrvBucketHeader, RrvEntry, RrvIter, RrvLocation};
 use crate::superblock::{select_freshest, Superblock, SUPERBLOCK_HEADER_BYTES};
 
 /// Body offset where the resident summary-descriptor page begins inside a
@@ -75,14 +75,15 @@ impl<'a> Database<'a> {
     /// bucket header for diagnostics plus an iterator over the
     /// non-empty RRV entries.
     ///
-    /// The data RRV bucket's file position is reported in 256-byte
-    /// units in DBINFO; this method converts to a byte offset and
-    /// reads `rrv_bucket_size` bytes from that point.
+    /// The data RRV bucket's file position is converted to a byte offset
+    /// with [`DbHeader::position_bytes`], and `rrv_bucket_size` bytes are
+    /// read from that point. Modern-layout buckets only: a pre-Notes 5
+    /// bucket fails the header check here; see [`crate::LegacyRrvBucket`].
     pub fn data_rrv_iter(&self) -> Result<Option<(RrvBucketHeader, RrvIter<'a>)>, NsfError> {
         if !self.has_data_rrv() {
             return Ok(None);
         }
-        let byte_offset = u64::from(self.header.data_rrv_bucket_position) * 256;
+        let byte_offset = self.header.position_bytes(self.header.data_rrv_bucket_position);
         let bucket_size = self.header.rrv_bucket_size as u64;
         let end = byte_offset.saturating_add(bucket_size);
         if end > self.bytes.len() as u64 {
@@ -121,7 +122,7 @@ impl<'a> Database<'a> {
         if !self.has_non_data_rrv() {
             return Ok(None);
         }
-        let byte_offset = u64::from(self.header.non_data_rrv_bucket_position) * 256;
+        let byte_offset = self.header.position_bytes(self.header.non_data_rrv_bucket_position);
         let bucket_size = self.header.rrv_bucket_size as u64;
         let end = byte_offset.saturating_add(bucket_size);
         if end > self.bytes.len() as u64 {
@@ -422,6 +423,9 @@ impl<'a> Database<'a> {
     /// recovery is heuristic in *what it tries* but never in *what it
     /// returns*.
     pub fn enumerate_notes(&self) -> Result<NoteEnumeration, NsfError> {
+        if self.header.uses_byte_positions() {
+            return Ok(self.enumerate_legacy());
+        }
         let mut out = NoteEnumeration::default();
 
         // RRV bucket size: superblock copy preferred, DBINFO as the fallback.
@@ -505,27 +509,60 @@ impl<'a> Database<'a> {
                         (r, WithheldLocation::BucketSlot { bucket_index, slot_index })
                     }
                 };
-                match resolved {
-                    Ok(note) => out.notes.push(note),
-                    Err(reason) => {
-                        out.unresolved += 1;
-                        // Detail is capped so a corrupt database cannot make
-                        // enumeration allocate without bound. The count above
-                        // stays exact regardless.
-                        if out.withheld.len() < MAX_WITHHELD_DETAIL {
-                            out.withheld.push(WithheldEntry {
-                                rrv_identifier: entry.rrv_identifier,
-                                location,
-                                reason,
-                            });
-                        } else {
-                            out.withheld_truncated = true;
-                        }
-                    }
-                }
+                out.record(entry.rrv_identifier, location, resolved);
             }
         }
         Ok(out)
+    }
+
+    /// Enumeration for a pre-Notes 5 (ODS 20) database.
+    ///
+    /// There is no BDB, superblock or summary-bucket step to take: each RRV
+    /// entry is the byte offset of a note record, and the buckets form two
+    /// chains (data and non-data) that start at the DBINFO pointers and run
+    /// back through each header's previous-bucket field. See
+    /// [`LegacyRrvBucket`] for how that layout was established.
+    ///
+    /// The identity gate is the modern one, unchanged: a record is a note
+    /// only if it parses as a note header carrying the identifier its entry
+    /// claims. Nothing about the ODS 20 note record itself has been seen
+    /// yet, so if its layout differs, every entry is withheld and counted -
+    /// the enumeration says it found tens of thousands of entries and could
+    /// read none of them, rather than showing anything it cannot vouch for.
+    fn enumerate_legacy(&self) -> NoteEnumeration {
+        let mut out = NoteEnumeration::default();
+        let bucket_size = self.header.rrv_bucket_size as usize;
+        if bucket_size < crate::rrv::LEGACY_RRV_HEADER_BYTES {
+            return out;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for start in [
+            self.header.data_rrv_bucket_position,
+            self.header.non_data_rrv_bucket_position,
+        ] {
+            let mut pos = start;
+            // Every bucket is visited once: a chain that loops, or two chains
+            // that share a tail, cannot walk forever or count twice.
+            while pos != 0 && seen.insert(pos) {
+                let start = pos as usize;
+                let Some(slice) = self.bytes.get(start..start.saturating_add(bucket_size)) else {
+                    break;
+                };
+                let Ok(bucket) = LegacyRrvBucket::parse(slice) else {
+                    break;
+                };
+                for (id, off) in bucket.entries() {
+                    out.file_position_total += 1;
+                    let r = match self.bytes.get(off as usize..) {
+                        Some(buf) => self.note_at(id, off, buf),
+                        None => Err(WithheldReason::Unresolvable),
+                    };
+                    out.record(id, WithheldLocation::FileOffset { byte_offset: off }, r);
+                }
+                pos = bucket.previous_bucket_position;
+            }
+        }
+        out
     }
 
     /// Parse `buf` as a note header and apply the identity gate, reporting
@@ -652,14 +689,26 @@ impl<'a> Database<'a> {
         if identifier == 0 || size < 10 {
             return None;
         }
-        let off = (u64::from(identifier) << 8) as usize;
-        let obj = self.bytes.get(off..off.checked_add(size)?)?;
-        let hdr_size = u32::from_le_bytes([obj[2], obj[3], obj[4], obj[5]]) as usize;
-        let hdr_rrv = u32::from_le_bytes([obj[6], obj[7], obj[8], obj[9]]);
-        if obj[0] != 0x10 || obj[1] != 0x00 || hdr_size != size || hdr_rrv != expect_rrv {
-            return None;
+        let at = |off: u64| -> Option<&'a [u8]> {
+            let off = off as usize;
+            let obj = self.bytes.get(off..off.checked_add(size)?)?;
+            let hdr_size = u32::from_le_bytes([obj[2], obj[3], obj[4], obj[5]]) as usize;
+            let hdr_rrv = u32::from_le_bytes([obj[6], obj[7], obj[8], obj[9]]);
+            if obj[0] != 0x10 || obj[1] != 0x00 || hdr_size != size || hdr_rrv != expect_rrv {
+                return None;
+            }
+            Some(obj)
+        };
+        // A pre-Notes 5 database counts every other position in bytes, so
+        // this one is tried as bytes first. Unverified - no ODS 20 note has
+        // been seen - which is why pages stay as the fallback: the header
+        // check above means whichever reading is wrong returns nothing.
+        if self.header.uses_byte_positions() {
+            if let Some(obj) = at(u64::from(identifier)) {
+                return Some(obj);
+            }
         }
-        Some(obj)
+        at(u64::from(identifier) << 8)
     }
 
     /// Decode a note's rich-text body and attachments from its non-summary
@@ -727,12 +776,9 @@ impl<'a> Database<'a> {
                 let WithheldReason::NotANoteRecord { found_signature } = wh.reason else {
                     return None;
                 };
-                let WithheldLocation::FilePosition { file_position_pages } = wh.location else {
-                    // A bucket slot needs the bucket walk to locate; not
-                    // offered rather than guessed at.
-                    return None;
-                };
-                let off = u64::from(file_position_pages) << 8;
+                // A bucket slot needs the bucket walk to locate; not offered
+                // rather than guessed at.
+                let off = wh.location.byte_offset()?;
                 let declared_len = self
                     .bytes
                     .get(off as usize + 2..off as usize + 6)
@@ -908,6 +954,22 @@ pub enum WithheldLocation {
         /// Slot within the bucket.
         slot_index: u16,
     },
+    /// A direct file position in bytes, from a pre-Notes 5 RRV bucket.
+    FileOffset {
+        /// Byte offset the entry named.
+        byte_offset: u64,
+    },
+}
+
+impl WithheldLocation {
+    /// Byte offset of the target, for the two direct-position variants.
+    pub fn byte_offset(&self) -> Option<u64> {
+        match *self {
+            Self::FilePosition { file_position_pages } => Some(u64::from(file_position_pages) << 8),
+            Self::FileOffset { byte_offset } => Some(byte_offset),
+            Self::BucketSlot { .. } => None,
+        }
+    }
 }
 
 /// One RRV entry that failed the identity gate, with the reason it failed.
@@ -943,6 +1005,34 @@ pub struct NoteEnumeration {
 }
 
 impl NoteEnumeration {
+    /// Keep a resolved note, or count and (within the cap) describe why an
+    /// entry was withheld.
+    fn record(
+        &mut self,
+        rrv_identifier: u32,
+        location: WithheldLocation,
+        resolved: Result<ResolvedNote, WithheldReason>,
+    ) {
+        match resolved {
+            Ok(note) => self.notes.push(note),
+            Err(reason) => {
+                self.unresolved += 1;
+                // Detail is capped so a corrupt database cannot make
+                // enumeration allocate without bound. The count above stays
+                // exact regardless.
+                if self.withheld.len() < MAX_WITHHELD_DETAIL {
+                    self.withheld.push(WithheldEntry {
+                        rrv_identifier,
+                        location,
+                        reason,
+                    });
+                } else {
+                    self.withheld_truncated = true;
+                }
+            }
+        }
+    }
+
     /// Count of withheld entries (among those with retained detail) that
     /// carry `reason`'s discriminant.
     pub fn withheld_count(&self, matches: impl Fn(&WithheldReason) -> bool) -> usize {
@@ -957,11 +1047,22 @@ impl NoteEnumeration {
     /// nonetheless carries the note signature (a note record that failed to
     /// parse). An [`WithheldReason::IdentityMismatch`] is ordinary slot
     /// reuse and a non-note signature was never a note, so neither counts.
+    ///
+    /// Except at a pre-Notes 5 offset: there "not the note signature" only
+    /// means "not the modern note signature", because no ODS 20 note record
+    /// has been seen. Calling those non-note allocations would let a
+    /// database whose every note failed to parse report that nothing was
+    /// missed, so they count.
     pub fn missed_evidence_count(&self) -> usize {
         self.withheld
             .iter()
             .filter(|w| match w.reason {
                 WithheldReason::Unresolvable => true,
+                WithheldReason::NotANoteRecord { .. }
+                    if matches!(w.location, WithheldLocation::FileOffset { .. }) =>
+                {
+                    true
+                }
                 WithheldReason::NotANoteRecord { found_signature } => {
                     found_signature == u16::from_le_bytes(crate::note::NOTE_SIGNATURE)
                 }
@@ -1057,7 +1158,9 @@ mod non_note_tests {
                 continue;
             }
             match wh.location {
-                WithheldLocation::FilePosition { .. } => file_pos += 1,
+                WithheldLocation::FilePosition { .. } | WithheldLocation::FileOffset { .. } => {
+                    file_pos += 1
+                }
                 WithheldLocation::BucketSlot { .. } => bucket += 1,
             }
         }
@@ -1073,5 +1176,100 @@ mod non_note_tests {
             declared_len: Some(1000),
         };
         assert!(r.bytes(&[0u8; 64]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+
+    const BUCKET: usize = 0x100;
+
+    /// A synthetic ODS 20 file shaped like the first real one: DBINFO
+    /// positions in bytes, a data chain of two buckets (newest first, linked
+    /// back through the header), and one non-data bucket.
+    fn ods20() -> Vec<u8> {
+        let mut b = vec![0u8; 0x4000];
+        b[0] = 0x1A;
+        b[2..6].copy_from_slice(&768u32.to_le_bytes());
+        let d = 6;
+        b[d..d + 4].copy_from_slice(&20u32.to_le_bytes());
+        b[d + 14..d + 18].copy_from_slice(&0x1300u32.to_le_bytes()); // non-data RRV
+        b[d + 38..d + 40].copy_from_slice(&0x0250u16.to_le_bytes()); // flags, template bit set
+        b[d + 56..d + 60].copy_from_slice(&0x1100u32.to_le_bytes()); // data RRV (newest)
+        b[d + 70..d + 72].copy_from_slice(&(BUCKET as u16).to_le_bytes());
+        b[d + 82..d + 86].copy_from_slice(&0x4000u32.to_le_bytes()); // file size, bytes
+
+        let bucket = |b: &mut Vec<u8>, at: usize, prev: u32, initial: u32, entries: &[u32]| {
+            b[at..at + BUCKET].fill(0xFF);
+            b[at] = 0x06;
+            b[at + 1] = 0x0A;
+            b[at + 2..at + 6].copy_from_slice(&prev.to_le_bytes());
+            b[at + 6..at + 10].copy_from_slice(&initial.to_le_bytes());
+            for (i, e) in entries.iter().enumerate() {
+                let o = at + 10 + i * 4;
+                b[o..o + 4].copy_from_slice(&e.to_le_bytes());
+            }
+        };
+        let note = |b: &mut Vec<u8>, at: usize, id: u32| {
+            b[at] = 0x04;
+            b[at + 2..at + 6].copy_from_slice(&100u32.to_le_bytes());
+            b[at + 6..at + 10].copy_from_slice(&id.to_le_bytes());
+            b[at + 40..at + 42].copy_from_slice(&1u16.to_le_bytes());
+        };
+        // Older data bucket, ids 10.. ; newest, ids 1002..
+        bucket(&mut b, 0x1000, 0, 10, &[0x2040, u32::MAX, 0x2100]);
+        bucket(&mut b, 0x1100, 0x1000, 1002, &[0x2200]);
+        bucket(&mut b, 0x1300, 0, 30, &[0x2300]);
+        note(&mut b, 0x2040, 10);
+        note(&mut b, 0x2100, 18);
+        note(&mut b, 0x2200, 1002);
+        // 0x2300 is left as something that is not a modern note record.
+        b[0x2300] = 0x07;
+        b
+    }
+
+    #[test]
+    fn an_ods20_header_counts_bytes_and_is_not_a_template() {
+        let b = ods20();
+        let db = Database::open(&b).unwrap();
+        let h = db.header();
+        assert!(h.uses_byte_positions());
+        assert_eq!(h.file_size_from_header_bytes(), 0x4000);
+        assert!(!h.is_template(), "the 0x0010 bit is unverified before ODS 43");
+    }
+
+    #[test]
+    fn the_legacy_walk_follows_both_chains_through_the_identity_gate() {
+        let b = ods20();
+        let en = Database::open(&b).unwrap().enumerate_notes().unwrap();
+        let mut ids: Vec<u32> = en.notes.iter().map(|n| n.rrv_identifier).collect();
+        ids.sort();
+        assert_eq!(ids, vec![10, 18, 1002], "both data buckets, empties skipped");
+        assert_eq!(en.file_position_total, 4);
+        assert_eq!(en.unresolved, 1);
+        let w = en.withheld[0];
+        assert_eq!(w.rrv_identifier, 30);
+        assert_eq!(w.location, WithheldLocation::FileOffset { byte_offset: 0x2300 });
+    }
+
+    /// No ODS 20 note record has been seen, so a target that fails the
+    /// modern signature cannot be written off as "never a note". If it
+    /// were, a database whose every note failed would report nothing missed.
+    #[test]
+    fn an_unreadable_legacy_target_counts_as_missed_evidence() {
+        let b = ods20();
+        let en = Database::open(&b).unwrap().enumerate_notes().unwrap();
+        assert_eq!(en.missed_evidence_count(), 1);
+        assert!(!en.all_gaps_explained());
+    }
+
+    /// A chain whose previous pointer loops back must end, not spin.
+    #[test]
+    fn a_looping_chain_is_walked_once() {
+        let mut b = ods20();
+        b[0x1000 + 2..0x1000 + 6].copy_from_slice(&0x1100u32.to_le_bytes());
+        let en = Database::open(&b).unwrap().enumerate_notes().unwrap();
+        assert_eq!(en.notes.len(), 3);
     }
 }

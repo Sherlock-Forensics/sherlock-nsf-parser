@@ -241,9 +241,132 @@ impl<'a> Iterator for RrvIter<'a> {
     }
 }
 
+/// Header size of a pre-Notes 5 (ODS 20) RRV bucket. The header-size byte
+/// at offset 1 carries this value, as the modern format's carries 0x20.
+pub const LEGACY_RRV_HEADER_BYTES: usize = 10;
+/// Bytes per entry in a pre-Notes 5 RRV bucket.
+pub const LEGACY_RRV_ENTRY_BYTES: usize = 4;
+
+/// A pre-Notes 5 (ODS 20) RRV bucket.
+///
+/// Decoded from a real Notes 4 mail file, not from a published spec:
+///
+/// ```text
+/// offset  width  field
+///     0      1   signature (0x06, as in the modern format)
+///     1      1   header_size (0x0A)
+///     2      4   previous bucket's file position, in bytes
+///     6      4   initial_rrv_identifier
+///    10    4*n   entries: the note record's file position, in bytes
+/// ```
+///
+/// Why each field is read this way, from that file:
+///
+/// - the data bucket DBINFO names had an initial identifier of 163,862 and
+///   300 used entries, and DBINFO's next-available data identifier was
+///   165,062 - exactly `163,862 + 300 * 4`;
+/// - an 8,192-byte bucket holds 2,045 entries, and DBINFO's first data
+///   identifier, 8,442, is exactly 19 buckets of `2,045 * 4` below 163,862;
+///   so DBINFO names the newest bucket and the header pointer leads back
+///   through the older ones;
+/// - every used entry lies inside the file on a 64-byte boundary, which is
+///   the database's allocation granularity;
+/// - empty entries are `0xFFFFFFFF`, and runs of them sit between used
+///   entries in the non-data bucket, as deleted notes would leave.
+#[derive(Debug, Clone, Copy)]
+pub struct LegacyRrvBucket<'a> {
+    /// File position (bytes) of the previous bucket in the chain; 0 at the
+    /// oldest.
+    pub previous_bucket_position: u32,
+    /// Identifier of the first entry. Each entry's identifier is
+    /// `initial_rrv_identifier + index * 4`.
+    pub initial_rrv_identifier: u32,
+    entries: &'a [u8],
+}
+
+impl<'a> LegacyRrvBucket<'a> {
+    /// Parse a whole bucket. Errors on a bad signature or a header size
+    /// other than [`LEGACY_RRV_HEADER_BYTES`].
+    pub fn parse(bucket: &'a [u8]) -> Result<Self, NsfError> {
+        if bucket.len() < LEGACY_RRV_HEADER_BYTES {
+            return Err(NsfError::TooShort {
+                actual: bucket.len(),
+                required: LEGACY_RRV_HEADER_BYTES,
+            });
+        }
+        if bucket[0] != RRV_BUCKET_SIGNATURE {
+            return Err(NsfError::BadFileSignature {
+                observed: [bucket[0], 0],
+            });
+        }
+        if bucket[1] as usize != LEGACY_RRV_HEADER_BYTES {
+            return Err(NsfError::BadHeaderSize {
+                size: bucket[1] as u32,
+            });
+        }
+        let u32_at = |o: usize| {
+            u32::from_le_bytes([bucket[o], bucket[o + 1], bucket[o + 2], bucket[o + 3]])
+        };
+        Ok(Self {
+            previous_bucket_position: u32_at(2),
+            initial_rrv_identifier: u32_at(6),
+            entries: &bucket[LEGACY_RRV_HEADER_BYTES..],
+        })
+    }
+
+    /// Used entries as `(rrv_identifier, byte_offset)`. Empty entries
+    /// (`0xFFFFFFFF`, and 0, which cannot be a note's position because the
+    /// file header lives there) are skipped.
+    pub fn entries(&self) -> impl Iterator<Item = (u32, u64)> + 'a {
+        let initial = self.initial_rrv_identifier;
+        self.entries
+            .chunks_exact(LEGACY_RRV_ENTRY_BYTES)
+            .enumerate()
+            .filter_map(move |(i, e)| {
+                let pos = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                if pos == 0 || pos == u32::MAX {
+                    return None;
+                }
+                let id = initial.wrapping_add((i as u32).wrapping_mul(4));
+                Some((id, u64::from(pos)))
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_bucket_reads_ids_and_byte_offsets_and_skips_empties() {
+        let mut b = vec![0xFFu8; LEGACY_RRV_HEADER_BYTES + 4 * LEGACY_RRV_ENTRY_BYTES];
+        b[0] = RRV_BUCKET_SIGNATURE;
+        b[1] = 0x0A;
+        b[2..6].copy_from_slice(&0x09CF_A000u32.to_le_bytes());
+        b[6..10].copy_from_slice(&163_862u32.to_le_bytes());
+        b[10..14].copy_from_slice(&0x0BEB_5E40u32.to_le_bytes());
+        // entry 1 left empty (0xFFFFFFFF)
+        b[18..22].copy_from_slice(&0u32.to_le_bytes());
+        b[22..26].copy_from_slice(&0x004B_A800u32.to_le_bytes());
+        let bucket = LegacyRrvBucket::parse(&b).unwrap();
+        assert_eq!(bucket.previous_bucket_position, 0x09CF_A000);
+        let got: Vec<_> = bucket.entries().collect();
+        assert_eq!(got, vec![(163_862, 0x0BEB_5E40), (163_874, 0x004B_A800)]);
+    }
+
+    /// The two layouts share a signature byte, so the header size is what
+    /// keeps either parser from reading the other's bucket.
+    #[test]
+    fn legacy_and_modern_buckets_refuse_each_other() {
+        let mut legacy = vec![0u8; 64];
+        legacy[0] = RRV_BUCKET_SIGNATURE;
+        legacy[1] = 0x0A;
+        assert!(RrvBucketHeader::parse(&legacy).is_err());
+        let mut modern = vec![0u8; 64];
+        modern[0] = RRV_BUCKET_SIGNATURE;
+        modern[1] = 0x20;
+        assert!(LegacyRrvBucket::parse(&modern).is_err());
+    }
 
     fn synthetic_bucket_with_entries(entries: &[(u32, u32)]) -> Vec<u8> {
         let mut buf = vec![0u8; RRV_BUCKET_HEADER_BYTES + entries.len() * RRV_ENTRY_BYTES];

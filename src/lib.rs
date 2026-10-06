@@ -90,6 +90,6 @@ pub use info2::{BdbSlot, Information2, SuperblockSlot};
 pub use item::{field_kind, parse_items, FieldKind, NoteItem};
 pub use note::NoteHeader;
 pub use ods::Ods;
-pub use rrv::{RrvBucketHeader, RrvEntry, RrvIter, RrvLocation};
+pub use rrv::{LegacyRrvBucket, RrvBucketHeader, RrvEntry, RrvIter, RrvLocation};
 pub use superblock::{select_freshest, Superblock};
 pub use time::{DecodedTimedate, Timedate};
