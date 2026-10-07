@@ -425,8 +425,39 @@ impl ItemWalk<'_> {
 
 /// Walk a note's items and report what happened, not only what worked.
 pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
+    walk_items_at(record, number_of_note_items, NOTE_HEADER_BYTES, None)
+}
+
+/// Sum of the declared sizes of the non-summary items, read from the
+/// descriptor table at `header_len`. `None` when the table does not fit.
+pub fn non_summary_total(record: &[u8], number_of_note_items: u16, header_len: usize) -> Option<usize> {
     let count = number_of_note_items as usize;
-    let table_end = NOTE_HEADER_BYTES + count * ITEM_DESCRIPTOR_BYTES;
+    record.get(..header_len + count * ITEM_DESCRIPTOR_BYTES)?;
+    Some(
+        (0..count)
+            .map(|i| header_len + i * ITEM_DESCRIPTOR_BYTES)
+            .filter(|&d| u16::from_le_bytes([record[d + 2], record[d + 3]]) & ITEM_SUMMARY == 0)
+            .map(|d| u16::from_le_bytes([record[d + 4], record[d + 5]]) as usize)
+            .sum(),
+    )
+}
+
+/// The general walk: an item table starting at `header_len`, and optionally
+/// the note's non-summary data as bare item values.
+///
+/// `non_summary`, when given, must hold exactly the non-summary items'
+/// values in descriptor order - the caller checks that the sizes add up
+/// (see [`non_summary_total`]) - and those items then get their values from
+/// it instead of being reported as stored elsewhere. That is the pre-Notes 5
+/// layout; a modern non-summary object has a header and is not passed here.
+pub fn walk_items_at<'a>(
+    record: &'a [u8],
+    number_of_note_items: u16,
+    header_len: usize,
+    non_summary: Option<&'a [u8]>,
+) -> ItemWalk<'a> {
+    let count = number_of_note_items as usize;
+    let table_end = header_len + count * ITEM_DESCRIPTOR_BYTES;
     if record.len() < table_end {
         return ItemWalk {
             items: Vec::new(),
@@ -443,9 +474,10 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
     let mut unreached_name_ids = Vec::new();
     let mut unreached = Vec::new();
     let mut cursor = table_end;
+    let mut ns_cursor = 0usize;
     let mut stop = ItemWalkStop::Complete;
     for i in 0..count {
-        let d = NOTE_HEADER_BYTES + i * ITEM_DESCRIPTOR_BYTES;
+        let d = header_len + i * ITEM_DESCRIPTOR_BYTES;
         let name_id = u16::from_le_bytes([record[d], record[d + 1]]);
         let type_flags = u16::from_le_bytes([record[d + 2], record[d + 3]]);
         let value_size = u16::from_le_bytes([record[d + 4], record[d + 5]]) as usize;
@@ -458,7 +490,13 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
         // items are. A TEXT_LIST only decodes when its internal lengths
         // account for the bytes exactly, so that is not a judgement call.
         let in_record = type_flags & ITEM_SUMMARY != 0;
-        let value = if !in_record || stop != ItemWalkStop::Complete {
+        let value = if !in_record {
+            let v = non_summary.and_then(|ns| ns.get(ns_cursor..ns_cursor + value_size));
+            if v.is_some() {
+                ns_cursor += value_size;
+            }
+            v
+        } else if stop != ItemWalkStop::Complete {
             None
         } else if let Some(v) = record.get(cursor..cursor + value_size) {
             cursor += value_size;

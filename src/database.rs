@@ -598,7 +598,12 @@ impl<'a> Database<'a> {
         file_offset: u64,
         buf: &[u8],
     ) -> Result<ResolvedNote, WithheldReason> {
-        match NoteHeader::parse(buf) {
+        let parsed = if self.header.uses_byte_positions() {
+            NoteHeader::parse_legacy(buf)
+        } else {
+            NoteHeader::parse(buf)
+        };
+        match parsed {
             Ok(header) if header.rrv_identifier == expected_identifier => Ok(ResolvedNote {
                 rrv_identifier: expected_identifier,
                 file_offset,
@@ -693,7 +698,19 @@ impl<'a> Database<'a> {
     /// object segments for attachments). The returned slice is the whole
     /// object including that header; record-level decoding (CD records,
     /// attachment extraction) is a later slice.
+    ///
+    /// On a pre-Notes 5 database it is something else: the identifier is a
+    /// byte offset to the non-summary items' bare values, back to back in
+    /// descriptor order, with no header. Established on a Notes 4 mail file,
+    /// where the three sampled pointers opened on a "Received: from" header
+    /// and on rich-text values (type word 0x0001, then CD records), and the
+    /// size matched what the viewer showed for those notes. The slice is
+    /// returned only when the non-summary items' declared sizes add up to
+    /// exactly that size, so a misread pointer yields nothing.
     pub fn non_summary_data(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
+        if self.header.uses_byte_positions() {
+            return self.legacy_non_summary(note);
+        }
         self.object_bytes(
             note.header.non_summary_data_identifier,
             note.header.non_summary_data_size,
@@ -714,34 +731,63 @@ impl<'a> Database<'a> {
         if identifier == 0 || size < 10 {
             return None;
         }
-        let at = |off: u64| -> Option<&'a [u8]> {
-            let off = off as usize;
-            let obj = self.bytes.get(off..off.checked_add(size)?)?;
-            let hdr_size = u32::from_le_bytes([obj[2], obj[3], obj[4], obj[5]]) as usize;
-            let hdr_rrv = u32::from_le_bytes([obj[6], obj[7], obj[8], obj[9]]);
-            if obj[0] != 0x10 || obj[1] != 0x00 || hdr_size != size || hdr_rrv != expect_rrv {
-                return None;
-            }
-            Some(obj)
-        };
-        // A pre-Notes 5 database counts every other position in bytes, so
-        // this one is tried as bytes first. Unverified - no ODS 20 note has
-        // been seen - which is why pages stay as the fallback: the header
-        // check above means whichever reading is wrong returns nothing.
-        if self.header.uses_byte_positions() {
-            if let Some(obj) = at(u64::from(identifier)) {
-                return Some(obj);
-            }
+        let off = (u64::from(identifier) << 8) as usize;
+        let obj = self.bytes.get(off..off.checked_add(size)?)?;
+        let hdr_size = u32::from_le_bytes([obj[2], obj[3], obj[4], obj[5]]) as usize;
+        let hdr_rrv = u32::from_le_bytes([obj[6], obj[7], obj[8], obj[9]]);
+        if obj[0] != 0x10 || obj[1] != 0x00 || hdr_size != size || hdr_rrv != expect_rrv {
+            return None;
         }
-        at(u64::from(identifier) << 8)
+        Some(obj)
+    }
+
+    /// The note's record bytes, bounded to its declared size.
+    fn record(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
+        let start = note.file_offset as usize;
+        let end = start
+            .saturating_add(note.header.size as usize)
+            .min(self.bytes.len());
+        self.bytes.get(start..end)
+    }
+
+    /// Pre-Notes 5 non-summary data: see [`Self::non_summary_data`].
+    fn legacy_non_summary(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
+        let size = note.header.non_summary_data_size as usize;
+        if note.header.non_summary_data_identifier == 0 || size == 0 {
+            return None;
+        }
+        let declared = crate::item::non_summary_total(
+            self.record(note)?,
+            note.header.number_of_note_items,
+            crate::note::LEGACY_NOTE_HEADER_BYTES,
+        )?;
+        if declared != size {
+            return None;
+        }
+        let off = note.header.non_summary_data_identifier as usize;
+        self.bytes.get(off..off.checked_add(size)?)
     }
 
     /// Decode a note's rich-text body and attachments from its non-summary
     /// data (CD-record stream). Returns `None` when the note has no
     /// non-summary data or it decodes to nothing. See [`crate::cd`].
+    ///
+    /// On a pre-Notes 5 database the rich-text items' values are decoded
+    /// directly, since there is no object wrapping them.
     pub fn note_content(&self, note: &ResolvedNote) -> Option<crate::cd::NoteContent> {
-        let obj = self.non_summary_data(note)?;
-        let content = crate::cd::parse(obj);
+        let content = if self.header.uses_byte_positions() {
+            let values: Vec<&[u8]> = self
+                .note_items_walk(note)
+                .items
+                .iter()
+                .filter(|it| it.type_flags & crate::item::ITEM_SUMMARY == 0)
+                .filter(|it| it.value.get(..2) == Some(&[0x01, 0x00][..]))
+                .map(|it| it.value)
+                .collect();
+            crate::cd::parse_items(&values)
+        } else {
+            crate::cd::parse(self.non_summary_data(note)?)
+        };
         if content.is_empty() {
             None
         } else {
@@ -823,11 +869,7 @@ impl<'a> Database<'a> {
     }
 
     pub fn note_items_walk(&self, note: &ResolvedNote) -> crate::item::ItemWalk<'a> {
-        let start = note.file_offset as usize;
-        let end = start
-            .saturating_add(note.header.size as usize)
-            .min(self.bytes.len());
-        let Some(record) = self.bytes.get(start..end) else {
+        let Some(record) = self.record(note) else {
             return crate::item::ItemWalk {
                 items: Vec::new(),
                 claimed: note.header.number_of_note_items,
@@ -839,18 +881,21 @@ impl<'a> Database<'a> {
                 unreached: Vec::new(),
             };
         };
+        if self.header.uses_byte_positions() {
+            // 84-byte header, and the non-summary values are bare bytes this
+            // walk can hand out directly (checked to add up first).
+            return crate::item::walk_items_at(
+                record,
+                note.header.number_of_note_items,
+                crate::note::LEGACY_NOTE_HEADER_BYTES,
+                self.legacy_non_summary(note),
+            );
+        }
         crate::item::walk_items(record, note.header.number_of_note_items)
     }
 
     pub fn note_items(&self, note: &ResolvedNote) -> Vec<crate::item::NoteItem<'a>> {
-        let start = note.file_offset as usize;
-        let end = start
-            .saturating_add(note.header.size as usize)
-            .min(self.bytes.len());
-        let Some(record) = self.bytes.get(start..end) else {
-            return Vec::new();
-        };
-        crate::item::parse_items(record, note.header.number_of_note_items)
+        self.note_items_walk(note).items
     }
 }
 
@@ -1294,5 +1339,67 @@ mod legacy_tests {
         b[0x1000 + 2..0x1000 + 6].copy_from_slice(&0x1100u32.to_le_bytes());
         let en = Database::open(&b).unwrap().enumerate_notes().unwrap();
         assert_eq!(en.notes.len(), 3);
+    }
+
+    /// A Notes 4 mail note as the sampled ones are laid out: an 84-byte
+    /// header, the Body (non-summary) declared before the Subject, the
+    /// Subject's value in the record, and the Body's value bare at the
+    /// non-summary pointer.
+    fn with_mail_note(nonsum_size: u32) -> Vec<u8> {
+        let mut b = ods20();
+        let body: &[u8] = &[
+            0x01, 0x00, // TYPE_COMPOSITE
+            0x85, 0xFF, 0x0E, 0x00, 0, 0, 0, 0, b'H', b'e', b'l', b'l', b'o', b'!',
+        ];
+        let at = 0x2200;
+        b[at..at + 0x100].fill(0);
+        b[at] = 0x04;
+        b[at + 6..at + 10].copy_from_slice(&1002u32.to_le_bytes());
+        b[at + 40..at + 42].copy_from_slice(&1u16.to_le_bytes());
+        b[at + 50..at + 52].copy_from_slice(&2u16.to_le_bytes());
+        b[at + 56..at + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+        b[at + 60..at + 64].copy_from_slice(&nonsum_size.to_le_bytes());
+        let d = at + 84;
+        for (i, (id, flags, size)) in [(0x7Eu16, 0x0002u16, body.len() as u16), (0x68, 0x0004, 5)]
+            .iter()
+            .enumerate()
+        {
+            let o = d + i * 8;
+            b[o..o + 2].copy_from_slice(&id.to_le_bytes());
+            b[o + 2..o + 4].copy_from_slice(&flags.to_le_bytes());
+            b[o + 4..o + 6].copy_from_slice(&size.to_le_bytes());
+        }
+        b[d + 16..d + 21].copy_from_slice(b"Hi Ed");
+        let size = (84 + 16 + 5) as u32;
+        b[at + 2..at + 6].copy_from_slice(&size.to_le_bytes());
+        b[0x3000..0x3000 + body.len()].copy_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn a_legacy_note_reads_its_fields_and_its_body() {
+        let b = with_mail_note(16);
+        let db = Database::open(&b).unwrap();
+        let en = db.enumerate_notes().unwrap();
+        let n = en.notes.iter().find(|n| n.rrv_identifier == 1002).unwrap();
+        let w = db.note_items_walk(n);
+        let subject = w.items.iter().find(|i| i.name_id == 0x68).unwrap();
+        assert_eq!(subject.as_text(), "Hi Ed");
+        assert!(w.items.iter().any(|i| i.name_id == 0x7E), "the body item gets its value");
+        assert_eq!(db.note_content(n).unwrap().body_text, "Hello!");
+    }
+
+    /// The pointer is only trusted when the non-summary sizes add up to
+    /// the header's size. Off by one, and the body is not read at all.
+    #[test]
+    fn a_legacy_body_whose_sizes_do_not_add_up_is_not_read() {
+        let b = with_mail_note(17);
+        let db = Database::open(&b).unwrap();
+        let en = db.enumerate_notes().unwrap();
+        let n = en.notes.iter().find(|n| n.rrv_identifier == 1002).unwrap();
+        assert!(db.note_content(n).is_none());
+        let w = db.note_items_walk(n);
+        assert!(w.unreached.iter().any(|u| u.name_id == 0x7E));
+        assert_eq!(w.items.iter().find(|i| i.name_id == 0x68).unwrap().as_text(), "Hi Ed");
     }
 }

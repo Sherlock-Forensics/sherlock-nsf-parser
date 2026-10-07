@@ -60,6 +60,9 @@ pub const NOTE_SIGNATURE: [u8; 2] = [0x04, 0x00];
 /// Full note header size in bytes, including the trailing timestamp and
 /// folder fields.
 pub const NOTE_HEADER_BYTES: usize = 100;
+/// Note header size in a pre-Notes 5 (ODS 20) database. See
+/// [`NoteHeader::parse_legacy`].
+pub const LEGACY_NOTE_HEADER_BYTES: usize = 84;
 /// Shortest note header that is still a complete record: the fields through
 /// `non_summary_data_size` end exactly at offset 64.
 ///
@@ -146,6 +149,27 @@ pub struct NoteHeader {
 }
 
 impl NoteHeader {
+    /// Parse a pre-Notes 5 (ODS 20) note header, which is 84 bytes: the
+    /// modern layout through `parent_note_identifier`, with no folder
+    /// fields after it. The item table starts at byte 84.
+    ///
+    /// Established on a Notes 4 mail file: at byte 84 of three sampled
+    /// notes sit well-formed item descriptors (Principal, PostedDate and
+    /// others, with their summary flags), and reading the table from 100
+    /// instead skipped exactly two descriptors and read two from the values.
+    pub fn parse_legacy(bytes: &[u8]) -> Result<Self, NsfError> {
+        let head = bytes.get(..LEGACY_NOTE_HEADER_BYTES).ok_or(NsfError::TooShort {
+            actual: bytes.len(),
+            required: LEGACY_NOTE_HEADER_BYTES,
+        })?;
+        let mut h = Self::parse(head)?;
+        h.access_time = Some(Timedate::from_bytes(&head[64..72])?);
+        h.creation_time = Some(Timedate::from_bytes(&head[72..80])?);
+        h.parent_note_identifier =
+            Some(u32::from_le_bytes([head[80], head[81], head[82], head[83]]));
+        Ok(h)
+    }
+
     /// Parse a note header from at least the first 100 bytes of a note
     /// record. Errors on signature mismatch or short input.
     pub fn parse(bytes: &[u8]) -> Result<Self, NsfError> {

@@ -52,7 +52,11 @@ pub struct CdRecord<'a> {
 /// Walk the CD-record stream of a non-summary object (records start at
 /// [`CD_STREAM_START`]). Stops cleanly at a malformed / trailing-filler region.
 pub fn walk(obj: &[u8]) -> Vec<CdRecord<'_>> {
-    let mut i = CD_STREAM_START;
+    walk_from(obj, CD_STREAM_START)
+}
+
+fn walk_from(obj: &[u8], start: usize) -> Vec<CdRecord<'_>> {
+    let mut i = start;
     let mut out = Vec::new();
     while i + 2 <= obj.len() {
         let sig = obj[i];
@@ -257,7 +261,25 @@ fn file_name(body: &[u8]) -> Option<String> {
 
 /// Parse a non-summary object into its rich-text body + attachments.
 pub fn parse(obj: &[u8]) -> NoteContent {
-    let recs = walk(obj);
+    parse_records(walk(obj))
+}
+
+/// Parse the values of rich-text (TYPE_COMPOSITE) items directly, for a
+/// database whose non-summary data is the bare item values with no object
+/// header around them (pre-Notes 5). Each value opens with its 2-byte type
+/// word, then CD records; each is walked on its own so one item's padding
+/// cannot shift the next item's records.
+pub fn parse_items(values: &[&[u8]]) -> NoteContent {
+    let mut recs = Vec::new();
+    for v in values {
+        if let Some(stream) = v.get(2..) {
+            recs.extend(walk_from(stream, 0));
+        }
+    }
+    parse_records(recs)
+}
+
+fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
     let mut content = NoteContent::default();
 
     // Body text: concatenate CDTEXT runs (4-byte FONTID prefix, then LMBCS;
