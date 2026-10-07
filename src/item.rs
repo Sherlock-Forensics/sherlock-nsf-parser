@@ -1,8 +1,10 @@
 //! Note item parsing - the fields inside a note record.
 //!
 //! A note record is: the 100-byte note header, then `number_of_note_items`
-//! fixed 8-byte item descriptors, then the item values packed back to back
-//! in descriptor order. Reverse-engineered from the fakenames Person docs
+//! fixed 8-byte item descriptors, then the values of the SUMMARY items
+//! (`ITEM_SUMMARY` set) packed back to back in descriptor order. A
+//! non-summary item's value lives in the non-summary object and takes no
+//! space here. Reverse-engineered from the fakenames Person docs
 //! (validated against known field values - street addresses, e-mail
 //! addresses, names).
 //!
@@ -17,8 +19,8 @@
 //!     6      2   reserved
 //! ```
 //!
-//! Each item's value is `value_size` bytes, taken sequentially from the
-//! value region that begins right after the descriptor table at
+//! Each summary item's value is `value_size` bytes, taken sequentially from
+//! the value region that begins right after the descriptor table at
 //! `NOTE_HEADER_BYTES + number_of_note_items * ITEM_DESCRIPTOR_BYTES`.
 //!
 //! # What is and isn't decoded here
@@ -377,11 +379,12 @@ pub enum ItemWalkStop {
     Complete,
     /// The descriptor table itself does not fit inside the record.
     TableDoesNotFit { needed: usize, record_len: usize },
-    /// An item's declared value size runs past the end of the record, so the
-    /// values are not all stored inside it. Measured across the corpus, 1412
-    /// of 42854 notes stop this way and 19584 declared items are never
-    /// reached. Where those values live is not yet known, and guessing would
-    /// be worse than saying so.
+    /// A summary item's declared value size runs past the end of the record.
+    /// Since the walk stopped charging non-summary items against the record
+    /// (0.1.18), 210 of 51,913 corpus notes stop this way, down from 10,421,
+    /// and 696 summary items go unreached, down from 38,385. Where those
+    /// last values live is not known, and guessing would be worse than
+    /// saying so.
     ValueOverrunsRecord {
         index: usize,
         declared_size: usize,
@@ -437,6 +440,8 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
         };
     }
     let mut items = Vec::with_capacity(count);
+    let mut unreached_name_ids = Vec::new();
+    let mut unreached = Vec::new();
     let mut cursor = table_end;
     let mut stop = ItemWalkStop::Complete;
     for i in 0..count {
@@ -444,41 +449,43 @@ pub fn walk_items(record: &[u8], number_of_note_items: u16) -> ItemWalk<'_> {
         let name_id = u16::from_le_bytes([record[d], record[d + 1]]);
         let type_flags = u16::from_le_bytes([record[d + 2], record[d + 3]]);
         let value_size = u16::from_le_bytes([record[d + 4], record[d + 5]]) as usize;
-        let Some(value) = record.get(cursor..cursor + value_size) else {
+        // Only summary items keep their value in the record. A non-summary
+        // item's value lives in the non-summary object, so it takes no space
+        // here, and charging its size against the record shifts every later
+        // value onto the wrong bytes. Measured on the corpus: of 15,642
+        // summary TEXT_LIST values that follow a non-summary item, 345 decode
+        // exactly when every item is charged and 14,263 when only summary
+        // items are. A TEXT_LIST only decodes when its internal lengths
+        // account for the bytes exactly, so that is not a judgement call.
+        let in_record = type_flags & ITEM_SUMMARY != 0;
+        let value = if !in_record || stop != ItemWalkStop::Complete {
+            None
+        } else if let Some(v) = record.get(cursor..cursor + value_size) {
+            cursor += value_size;
+            Some(v)
+        } else {
             stop = ItemWalkStop::ValueOverrunsRecord {
                 index: i,
                 declared_size: value_size,
                 remaining: record.len().saturating_sub(cursor),
             };
-            break;
+            None
         };
-        cursor += value_size;
-        items.push(NoteItem {
-            name_id,
-            type_flags,
-            value,
-        });
-    }
-    let mut unreached_name_ids = Vec::new();
-    let mut unreached = Vec::new();
-    for i in items.len()..count {
-        let d = NOTE_HEADER_BYTES + i * ITEM_DESCRIPTOR_BYTES;
-        let (Some(a), Some(b)) = (record.get(d), record.get(d + 1)) else {
-            break;
-        };
-        let name_id = u16::from_le_bytes([*a, *b]);
-        // The descriptor table is fixed-width, so an item's flags are still
-        // readable even where the walk could not reach its value.
-        let flags = match (record.get(d + 2), record.get(d + 3)) {
-            (Some(x), Some(y)) => u16::from_le_bytes([*x, *y]),
-            _ => 0,
-        };
-        unreached_name_ids.push(name_id);
-        unreached.push(UnreachedItem {
-            name_id,
-            flags,
-            reason: UnreachedReason::classify(flags),
-        });
+        match value {
+            Some(value) => items.push(NoteItem {
+                name_id,
+                type_flags,
+                value,
+            }),
+            None => {
+                unreached_name_ids.push(name_id);
+                unreached.push(UnreachedItem {
+                    name_id,
+                    flags: type_flags,
+                    reason: UnreachedReason::classify(type_flags),
+                });
+            }
+        }
     }
     ItemWalk {
         items,
@@ -683,6 +690,30 @@ mod tests {
         assert_eq!(w.claimed, 3);
         assert_eq!(w.unreached(), 1);
     }
+
+    /// The shape that misread a fifth of the corpus and nearly every Notes 4
+    /// mail note: a body item (non-summary, its value elsewhere) declared
+    /// before the summary fields. Its size must not be charged against the
+    /// record, or every later field reads the wrong bytes.
+    #[test]
+    fn a_non_summary_item_takes_no_space_in_the_record() {
+        let mut rec = vec![0u8; NOTE_HEADER_BYTES];
+        for (id, flags, size) in [(0x7Eu16, 0x0002u16, 7219u16), (0x67, 0x0004, 5), (0x6B, 0x0004, 3)] {
+            rec.extend_from_slice(&id.to_le_bytes());
+            rec.extend_from_slice(&flags.to_le_bytes());
+            rec.extend_from_slice(&size.to_le_bytes());
+            rec.extend_from_slice(&0u16.to_le_bytes());
+        }
+        rec.extend_from_slice(b"Hello");
+        rec.extend_from_slice(b"Ed!");
+        let w = walk_items(&rec, 3);
+        assert_eq!(w.stop, ItemWalkStop::Complete);
+        let got: Vec<_> = w.items.iter().map(|i| (i.name_id, i.as_text())).collect();
+        assert_eq!(got, vec![(0x67, "Hello".to_string()), (0x6B, "Ed!".to_string())]);
+        assert_eq!(w.unreached.len(), 1);
+        assert_eq!(w.unreached[0].name_id, 0x7E);
+        assert_eq!(w.unreached[0].reason, UnreachedReason::ValueInNonSummary);
+    }
 }
 
 /// # Where the overflow values are NOT
@@ -722,10 +753,13 @@ mod tests {
 ///   sums gives no consistent offset (best diffs scatter across -32..+55
 ///   with no mode). They cannot account for the gap.
 ///
-/// The values' location remains unknown. Nothing here guesses at it, and
-/// black-box probing has now been tried twice; the next attempt should come
-/// from a format reference or from a database where the same note can be
-/// compared against a known-good export.
+/// Resolved (0.1.18): every attempt above assumed the walk charged ALL
+/// items against the record. Only summary items are stored there; charging
+/// a non-summary item's size shifted every later value and produced the
+/// overrun these diagnostics were chasing. The TEXT_LIST oracle settles it:
+/// 14,263 of 15,642 summary lists after a non-summary item decode under the
+/// summary-only walk, 345 under the old one. The diagnostics below still
+/// use the old arithmetic and are kept as the record of what was tried.
 #[cfg(test)]
 mod overflow_diagnostics {
     use super::*;

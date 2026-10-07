@@ -264,11 +264,168 @@ impl BucketDescriptorBlock {
             unk_classes,
         })
     }
+
+    /// Parse a pre-Notes 5 (ODS 20) BDB: uncompressed, at DBINFO's BDB
+    /// position read as bytes.
+    ///
+    /// Decoded from a real Notes 4 mail file, where every boundary below
+    /// is fixed by the header's own counts and the last name ends exactly at
+    /// the header's used-size word:
+    ///
+    /// ```text
+    /// header (32 bytes)
+    ///   0   2   signature (0x01 0x00)
+    ///   2   2   0x8000 in the one file seen; not checked
+    ///   6   2   number of summary-bucket descriptors (12 bytes each)
+    ///   8   2   number of Unique Name Keys (8 bytes each)
+    ///  10   2   number of RRV bucket descriptors (8 bytes each)
+    ///  12   2   bytes used: the end of the name text
+    /// 32  RRV bucket descriptors: position (bytes; bit 0 set = non-data),
+    ///     initial_rrv_identifier
+    ///     summary-bucket descriptors: position, TIMEDATE
+    ///     UNK entries: text_offset u16, length u16, type u8, class u8, u16
+    ///     name text, packed, offsets relative to its start
+    /// ```
+    ///
+    /// The sample's names chained perfectly - each of 1,677 offsets is the
+    /// previous offset plus its length - and resolved the mail fields to
+    /// their expected names (SendTo, Subject, From, Body, PostedDate). The
+    /// parse refuses anything whose counts do not land the text end on the
+    /// used-size word, so a different layout yields no names rather than
+    /// wrong ones.
+    pub fn parse_legacy(file: &[u8], offset: u64, available_size: u32) -> Result<Self, NsfError> {
+        const HEADER: usize = 32;
+        const SUMMARY_DESCRIPTOR: usize = 12;
+        const UNK_ENTRY: usize = 8;
+        let start = offset as usize;
+        let block = file
+            .get(start..start.saturating_add(available_size as usize))
+            .filter(|b| b.len() >= HEADER)
+            .ok_or(NsfError::TooShort {
+                actual: file.len(),
+                required: start.saturating_add(available_size as usize),
+            })?;
+        if block[0] != 0x01 || block[1] != 0x00 {
+            return Err(NsfError::BadSubrecordSignature {
+                kind: "bucket descriptor block",
+                expected: [0x01, 0x00],
+                observed: [block[0], block[1]],
+            });
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([block[o], block[o + 1]]) as usize;
+        let u32_at = |o: usize| u32::from_le_bytes([block[o], block[o + 1], block[o + 2], block[o + 3]]);
+        let n_summary = u16_at(6);
+        let n_unk = u16_at(8);
+        let n_rrv = u16_at(10);
+        let used = u16_at(12);
+        let unk_start = HEADER + n_rrv * RRV_DESCRIPTOR_BYTES + n_summary * SUMMARY_DESCRIPTOR;
+        let text_start = unk_start + n_unk * UNK_ENTRY;
+        let inconsistent = NsfError::DecompressionFailed {
+            detail: "legacy bucket descriptor block counts do not account for its size",
+        };
+        if used > block.len() || text_start > used {
+            return Err(inconsistent);
+        }
+        if n_unk > 0 {
+            let last = unk_start + (n_unk - 1) * UNK_ENTRY;
+            if text_start + u16_at(last) + u16_at(last + 2) != used {
+                return Err(inconsistent);
+            }
+        }
+
+        let rrv_buckets = (0..n_rrv)
+            .map(|i| {
+                let o = HEADER + i * RRV_DESCRIPTOR_BYTES;
+                let raw = u32_at(o);
+                RrvBucketDescriptor {
+                    kind: if raw & 1 != 0 { RrvBucketKind::NonData } else { RrvBucketKind::Data },
+                    file_offset: u64::from(raw & 0xFFFF_FFFE),
+                    initial_rrv_identifier: u32_at(o + 4),
+                }
+            })
+            .collect();
+
+        let text = &block[text_start..used];
+        let mut unk_names = Vec::with_capacity(n_unk);
+        let mut unk_types = Vec::with_capacity(n_unk);
+        let mut unk_classes = Vec::with_capacity(n_unk);
+        for i in 0..n_unk {
+            let e = unk_start + i * UNK_ENTRY;
+            let (off, len) = (u16_at(e), u16_at(e + 2));
+            unk_names.push(
+                text.get(off..off + len)
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .unwrap_or_default(),
+            );
+            unk_types.push(block[e + 4]);
+            unk_classes.push(block[e + 5]);
+        }
+        Ok(Self {
+            write_count: 0,
+            rrv_buckets,
+            unk_names,
+            unk_types,
+            unk_classes,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A legacy BDB laid out like the Notes 4 sample: two RRV descriptors,
+    /// one summary descriptor, three names.
+    fn legacy_bdb() -> Vec<u8> {
+        let names: [(&str, u8, u8); 3] = [("SendTo", 0, 5), ("Subject", 0, 5), ("PostedDate", 0, 4)];
+        let mut b = vec![0u8; 32];
+        b[0] = 0x01;
+        b[2..4].copy_from_slice(&0x8000u16.to_le_bytes());
+        b[6..8].copy_from_slice(&1u16.to_le_bytes());
+        b[8..10].copy_from_slice(&3u16.to_le_bytes());
+        b[10..12].copy_from_slice(&2u16.to_le_bytes());
+        for (pos, id) in [(0xC001u32, 262u32), (0x0049_AC00, 8442)] {
+            b.extend_from_slice(&pos.to_le_bytes());
+            b.extend_from_slice(&id.to_le_bytes());
+        }
+        b.extend_from_slice(&[0u8; 12]);
+        let mut off = 0u16;
+        for (n, ty, cl) in names {
+            b.extend_from_slice(&off.to_le_bytes());
+            b.extend_from_slice(&(n.len() as u16).to_le_bytes());
+            b.extend_from_slice(&[ty, cl, 0x6E, 0x56]);
+            off += n.len() as u16;
+        }
+        for (n, _, _) in names {
+            b.extend_from_slice(n.as_bytes());
+        }
+        let used = b.len() as u16;
+        b[12..14].copy_from_slice(&used.to_le_bytes());
+        b.resize(256, 0);
+        b
+    }
+
+    #[test]
+    fn a_legacy_bdb_yields_names_kinds_and_byte_offsets() {
+        let b = legacy_bdb();
+        let bdb = BucketDescriptorBlock::parse_legacy(&b, 0, 256).unwrap();
+        assert_eq!(bdb.unk_names, vec!["SendTo", "Subject", "PostedDate"]);
+        assert_eq!(bdb.field_kind(1), crate::item::FieldKind::Text);
+        assert_eq!(bdb.field_kind(2), crate::item::FieldKind::Time);
+        assert_eq!(bdb.rrv_buckets[0].kind, RrvBucketKind::NonData);
+        assert_eq!(bdb.rrv_buckets[0].file_offset, 0xC000);
+        assert_eq!(bdb.rrv_buckets[1].file_offset, 0x0049_AC00);
+        assert_eq!(bdb.rrv_buckets[1].initial_rrv_identifier, 8442);
+    }
+
+    /// Counts that do not land the text on the used-size word mean the
+    /// layout is not the one decoded; no names beats wrong names.
+    #[test]
+    fn a_legacy_bdb_whose_counts_do_not_close_is_refused() {
+        let mut b = legacy_bdb();
+        b[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert!(BucketDescriptorBlock::parse_legacy(&b, 0, 256).is_err());
+    }
 
     #[test]
     fn rejects_bad_signature() {

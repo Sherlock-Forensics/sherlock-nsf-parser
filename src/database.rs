@@ -379,6 +379,21 @@ impl<'a> Database<'a> {
     /// copies in [`Information2`] (primary + write-ahead-log redundancy) the
     /// one with the higher `write_count` is authoritative.
     pub fn bucket_descriptor_block(&self) -> Result<Option<BucketDescriptorBlock>, NsfError> {
+        if self.header.uses_byte_positions() {
+            // One uncompressed copy, named directly by DBINFO. A layout that
+            // does not close is no BDB rather than an error: the notes are
+            // still readable without field names.
+            let pos = self.header.bucket_descriptor_block_position;
+            if pos == 0 {
+                return Ok(None);
+            }
+            return Ok(BucketDescriptorBlock::parse_legacy(
+                self.bytes,
+                self.header.position_bytes(pos),
+                self.header.bucket_descriptor_block_size,
+            )
+            .ok());
+        }
         let info = self.information2()?;
         let mut best: Option<BucketDescriptorBlock> = None;
         for slot in &info.bdbs {
@@ -525,10 +540,9 @@ impl<'a> Database<'a> {
     ///
     /// The identity gate is the modern one, unchanged: a record is a note
     /// only if it parses as a note header carrying the identifier its entry
-    /// claims. Nothing about the ODS 20 note record itself has been seen
-    /// yet, so if its layout differs, every entry is withheld and counted -
-    /// the enumeration says it found tens of thousands of entries and could
-    /// read none of them, rather than showing anything it cannot vouch for.
+    /// claims. On the first ODS 20 mail file 10,231 notes passed it with the
+    /// modern note header unchanged; the other 3,436 entries pointed at
+    /// 0x0007 records, which are not notes.
     fn enumerate_legacy(&self) -> NoteEnumeration {
         let mut out = NoteEnumeration::default();
         let bucket_size = self.header.rrv_bucket_size as usize;
@@ -536,10 +550,21 @@ impl<'a> Database<'a> {
             return out;
         }
         let mut seen = std::collections::BTreeSet::new();
-        for start in [
+        // The chains from DBINFO, plus every bucket the BDB lists, so a
+        // break in a chain cannot hide the buckets beyond it. Each is walked
+        // once whichever route reaches it first.
+        let mut starts = vec![
             self.header.data_rrv_bucket_position,
             self.header.non_data_rrv_bucket_position,
-        ] {
+        ];
+        if let Ok(Some(bdb)) = self.bucket_descriptor_block() {
+            starts.extend(
+                bdb.rrv_buckets
+                    .iter()
+                    .filter_map(|d| u32::try_from(d.file_offset).ok()),
+            );
+        }
+        for start in starts {
             let mut pos = start;
             // Every bucket is visited once: a chain that loops, or two chains
             // that share a tail, cannot walk forever or count twice.
@@ -1048,21 +1073,14 @@ impl NoteEnumeration {
     /// parse). An [`WithheldReason::IdentityMismatch`] is ordinary slot
     /// reuse and a non-note signature was never a note, so neither counts.
     ///
-    /// Except at a pre-Notes 5 offset: there "not the note signature" only
-    /// means "not the modern note signature", because no ODS 20 note record
-    /// has been seen. Calling those non-note allocations would let a
-    /// database whose every note failed to parse report that nothing was
-    /// missed, so they count.
+    /// The same holds on a pre-Notes 5 database: its notes carry the same
+    /// 0x0004 signature (10,231 resolved that way on the first ODS 20 mail
+    /// file), so a target without it is not a note there either.
     pub fn missed_evidence_count(&self) -> usize {
         self.withheld
             .iter()
             .filter(|w| match w.reason {
                 WithheldReason::Unresolvable => true,
-                WithheldReason::NotANoteRecord { .. }
-                    if matches!(w.location, WithheldLocation::FileOffset { .. }) =>
-                {
-                    true
-                }
                 WithheldReason::NotANoteRecord { found_signature } => {
                     found_signature == u16::from_le_bytes(crate::note::NOTE_SIGNATURE)
                 }
@@ -1253,15 +1271,20 @@ mod legacy_tests {
         assert_eq!(w.location, WithheldLocation::FileOffset { byte_offset: 0x2300 });
     }
 
-    /// No ODS 20 note record has been seen, so a target that fails the
-    /// modern signature cannot be written off as "never a note". If it
-    /// were, a database whose every note failed would report nothing missed.
+    /// ODS 20 notes carry the modern 0x0004 signature, so a target without
+    /// it is classified as on any other database: not a note. A real note
+    /// under another identifier is stale reuse, as anywhere else.
     #[test]
-    fn an_unreadable_legacy_target_counts_as_missed_evidence() {
-        let b = ods20();
+    fn legacy_targets_are_classified_by_signature_like_any_other() {
+        let mut b = ods20();
         let en = Database::open(&b).unwrap().enumerate_notes().unwrap();
-        assert_eq!(en.missed_evidence_count(), 1);
-        assert!(!en.all_gaps_explained());
+        assert_eq!(en.missed_evidence_count(), 0, "0x0007 is not a note");
+        b[0x2300] = 0x04;
+        b[0x2302..0x2306].copy_from_slice(&100u32.to_le_bytes());
+        b[0x2306..0x230A].copy_from_slice(&999u32.to_le_bytes());
+        let en = Database::open(&b).unwrap().enumerate_notes().unwrap();
+        assert_eq!(en.unresolved, 1);
+        assert!(matches!(en.withheld[0].reason, WithheldReason::IdentityMismatch { .. }));
     }
 
     /// A chain whose previous pointer loops back must end, not spin.
