@@ -49,6 +49,38 @@ fn read_u32_le(buf: &[u8], offset: usize) -> Option<u32> {
 pub struct Database<'a> {
     bytes: &'a [u8],
     header: DbHeader,
+    /// RRV identifier -> byte offset for direct file-position entries,
+    /// built on first use. See [`Self::object_payload`].
+    file_positions: std::sync::OnceLock<std::collections::HashMap<u32, u64>>,
+    /// Item name ids of `$FILE`, built on first use from the BDB.
+    file_name_ids: std::sync::OnceLock<Vec<u16>>,
+}
+
+/// Why an attachment's bytes could not be recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentError {
+    /// No direct RRV entry for the object, or it is not an object record.
+    ObjectNotFound,
+    /// An uncompressed object shorter than the declared file.
+    Truncated,
+    /// The Huffman payload did not decode to the declared file.
+    Huffman(crate::huff::HuffError),
+    /// LZ1 (2) or another scheme this build does not decode. LZ1 arrived in
+    /// Notes 6, so a Notes 4 database has none.
+    UnsupportedCompression(u16),
+    /// The object records the file's SHA-1 and the recovered bytes do not
+    /// match it.
+    Sha1Mismatch,
+}
+
+/// An object record's payload, and the SHA-1 it records for its file when
+/// it records one.
+#[derive(Debug, Clone, Copy)]
+pub struct StoredObject<'a> {
+    /// The bytes after the record header: the file, or its compressed form.
+    pub payload: &'a [u8],
+    /// The file's SHA-1 as hex, from a 0x001B header.
+    pub sha1: Option<&'a str>,
 }
 
 impl<'a> Database<'a> {
@@ -56,7 +88,44 @@ impl<'a> Database<'a> {
     /// header and DBINFO; lazy on everything else.
     pub fn open(bytes: &'a [u8]) -> Result<Self, NsfError> {
         let header = DbHeader::parse(bytes)?;
-        Ok(Self { bytes, header })
+        Ok(Self {
+            bytes,
+            header,
+            file_positions: Default::default(),
+            file_name_ids: Default::default(),
+        })
+    }
+
+    /// Name ids whose field name is `$FILE`.
+    fn file_name_ids(&self) -> &[u16] {
+        self.file_name_ids.get_or_init(|| {
+            self.bucket_descriptor_block()
+                .ok()
+                .flatten()
+                .map(|bdb| {
+                    bdb.unk_names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.eq_ignore_ascii_case("$FILE"))
+                        .filter_map(|(i, _)| u16::try_from(i).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// The note's `$FILE` descriptors, in item order.
+    pub fn file_objects(&self, note: &ResolvedNote) -> Vec<crate::item::FileObject> {
+        let ids = self.file_name_ids();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.note_items_walk(note)
+            .items
+            .iter()
+            .filter(|it| ids.contains(&it.name_id))
+            .filter_map(|it| it.as_file_object())
+            .collect()
     }
 
     /// Parsed database header.
@@ -442,50 +511,10 @@ impl<'a> Database<'a> {
             return Ok(self.enumerate_legacy());
         }
         let mut out = NoteEnumeration::default();
-
-        // RRV bucket size: superblock copy preferred, DBINFO as the fallback.
-        //
-        // The freshest superblock's `rrv_bucket_size` is 0 in a real slice of
-        // databases (ToDo.nsf, notebook12_EN.ntf and teamrm12_EN.ntf in the
-        // corpus) even though DBINFO names a valid 4096 and the RRV buckets
-        // are plainly present - 63, 157 and 495 non-data RRV entries
-        // respectively. Trusting the superblock copy alone returned zero
-        // notes for every such database, which the viewer then presented as
-        // an unreadable file.
-        //
-        // A missing superblock is likewise no longer fatal. The bucket
-        // offsets come from the BDB and the two DBINFO pointers below, never
-        // from the superblock, so its size field is the only thing wanted
-        // here and DBINFO carries that too.
-        let sb_size = self
-            .freshest_superblock()?
-            .map(|(_, sb)| sb.rrv_bucket_size as usize)
-            .unwrap_or(0);
-        let rrv_bucket_size = if sb_size != 0 {
-            sb_size
-        } else {
-            self.header.rrv_bucket_size as usize
-        };
-        if rrv_bucket_size == 0 {
+        let Some((rrv_bucket_size, rrv_offsets)) = self.modern_rrv_buckets()? else {
             return Ok(out);
-        }
+        };
         let raw_fps = self.summary_bucket_raw_fps()?;
-
-        // Collect every RRV bucket to walk: those listed in the BDB plus
-        // the data and non-data RRV buckets named directly in DBINFO.
-        // Deduped by byte offset - on modern ODS the DBINFO buckets are
-        // usually also in the BDB; on older / simpler databases they may
-        // not be, so both sources are needed for complete enumeration.
-        let mut rrv_offsets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        if let Some(bdb) = self.bucket_descriptor_block()? {
-            rrv_offsets.extend(bdb.rrv_buckets.iter().map(|d| d.file_offset));
-        }
-        if self.header.data_rrv_bucket_position != 0 {
-            rrv_offsets.insert(u64::from(self.header.data_rrv_bucket_position) * 256);
-        }
-        if self.header.non_data_rrv_bucket_position != 0 {
-            rrv_offsets.insert(u64::from(self.header.non_data_rrv_bucket_position) * 256);
-        }
 
         for &bucket_off in &rrv_offsets {
             let start = bucket_off as usize;
@@ -530,6 +559,96 @@ impl<'a> Database<'a> {
         Ok(out)
     }
 
+    /// The modern RRV bucket size and the byte offset of every RRV bucket.
+    /// `None` when no bucket size is known.
+    fn modern_rrv_buckets(
+        &self,
+    ) -> Result<Option<(usize, std::collections::BTreeSet<u64>)>, NsfError> {
+        // RRV bucket size: superblock copy preferred, DBINFO as the fallback.
+        //
+        // The freshest superblock's `rrv_bucket_size` is 0 in a real slice of
+        // databases (ToDo.nsf, notebook12_EN.ntf and teamrm12_EN.ntf in the
+        // corpus) even though DBINFO names a valid 4096 and the RRV buckets
+        // are plainly present - 63, 157 and 495 non-data RRV entries
+        // respectively. Trusting the superblock copy alone returned zero
+        // notes for every such database, which the viewer then presented as
+        // an unreadable file.
+        //
+        // A missing superblock is likewise no longer fatal. The bucket
+        // offsets come from the BDB and the two DBINFO pointers below, never
+        // from the superblock, so its size field is the only thing wanted
+        // here and DBINFO carries that too.
+        let sb_size = self
+            .freshest_superblock()?
+            .map(|(_, sb)| sb.rrv_bucket_size as usize)
+            .unwrap_or(0);
+        let rrv_bucket_size = if sb_size != 0 {
+            sb_size
+        } else {
+            self.header.rrv_bucket_size as usize
+        };
+        if rrv_bucket_size == 0 {
+            return Ok(None);
+        }
+
+        // Collect every RRV bucket to walk: those listed in the BDB plus
+        // the data and non-data RRV buckets named directly in DBINFO.
+        // Deduped by byte offset - on modern ODS the DBINFO buckets are
+        // usually also in the BDB; on older / simpler databases they may
+        // not be, so both sources are needed for complete enumeration.
+        let mut rrv_offsets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        if let Some(bdb) = self.bucket_descriptor_block()? {
+            rrv_offsets.extend(bdb.rrv_buckets.iter().map(|d| d.file_offset));
+        }
+        if self.header.data_rrv_bucket_position != 0 {
+            rrv_offsets.insert(u64::from(self.header.data_rrv_bucket_position) * 256);
+        }
+        if self.header.non_data_rrv_bucket_position != 0 {
+            rrv_offsets.insert(u64::from(self.header.non_data_rrv_bucket_position) * 256);
+        }
+        Ok(Some((rrv_bucket_size, rrv_offsets)))
+    }
+
+    /// Every pre-Notes 5 RRV bucket: the chains from DBINFO, plus every
+    /// bucket the BDB lists, so a break in a chain cannot hide the buckets
+    /// beyond it. Each bucket is returned once whichever route reaches it
+    /// first, so a chain that loops, or two that share a tail, cannot walk
+    /// forever or count twice.
+    fn legacy_rrv_buckets(&self) -> Vec<LegacyRrvBucket<'a>> {
+        let mut out = Vec::new();
+        let bucket_size = self.header.rrv_bucket_size as usize;
+        if bucket_size < crate::rrv::LEGACY_RRV_HEADER_BYTES {
+            return out;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut starts = vec![
+            self.header.data_rrv_bucket_position,
+            self.header.non_data_rrv_bucket_position,
+        ];
+        if let Ok(Some(bdb)) = self.bucket_descriptor_block() {
+            starts.extend(
+                bdb.rrv_buckets
+                    .iter()
+                    .filter_map(|d| u32::try_from(d.file_offset).ok()),
+            );
+        }
+        for start in starts {
+            let mut pos = start;
+            while pos != 0 && seen.insert(pos) {
+                let at = pos as usize;
+                let Some(slice) = self.bytes.get(at..at.saturating_add(bucket_size)) else {
+                    break;
+                };
+                let Ok(bucket) = LegacyRrvBucket::parse(slice) else {
+                    break;
+                };
+                pos = bucket.previous_bucket_position;
+                out.push(bucket);
+            }
+        }
+        out
+    }
+
     /// Enumeration for a pre-Notes 5 (ODS 20) database.
     ///
     /// There is no BDB, superblock or summary-bucket step to take: each RRV
@@ -545,49 +664,146 @@ impl<'a> Database<'a> {
     /// 0x0007 records, which are not notes.
     fn enumerate_legacy(&self) -> NoteEnumeration {
         let mut out = NoteEnumeration::default();
-        let bucket_size = self.header.rrv_bucket_size as usize;
-        if bucket_size < crate::rrv::LEGACY_RRV_HEADER_BYTES {
-            return out;
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        // The chains from DBINFO, plus every bucket the BDB lists, so a
-        // break in a chain cannot hide the buckets beyond it. Each is walked
-        // once whichever route reaches it first.
-        let mut starts = vec![
-            self.header.data_rrv_bucket_position,
-            self.header.non_data_rrv_bucket_position,
-        ];
-        if let Ok(Some(bdb)) = self.bucket_descriptor_block() {
-            starts.extend(
-                bdb.rrv_buckets
-                    .iter()
-                    .filter_map(|d| u32::try_from(d.file_offset).ok()),
-            );
-        }
-        for start in starts {
-            let mut pos = start;
-            // Every bucket is visited once: a chain that loops, or two chains
-            // that share a tail, cannot walk forever or count twice.
-            while pos != 0 && seen.insert(pos) {
-                let start = pos as usize;
-                let Some(slice) = self.bytes.get(start..start.saturating_add(bucket_size)) else {
-                    break;
+        for bucket in self.legacy_rrv_buckets() {
+            for (id, off) in bucket.entries() {
+                out.file_position_total += 1;
+                let r = match self.bytes.get(off as usize..) {
+                    Some(buf) => self.note_at(id, off, buf),
+                    None => Err(WithheldReason::Unresolvable),
                 };
-                let Ok(bucket) = LegacyRrvBucket::parse(slice) else {
-                    break;
-                };
-                for (id, off) in bucket.entries() {
-                    out.file_position_total += 1;
-                    let r = match self.bytes.get(off as usize..) {
-                        Some(buf) => self.note_at(id, off, buf),
-                        None => Err(WithheldReason::Unresolvable),
-                    };
-                    out.record(id, WithheldLocation::FileOffset { byte_offset: off }, r);
-                }
-                pos = bucket.previous_bucket_position;
+                out.record(id, WithheldLocation::FileOffset { byte_offset: off }, r);
             }
         }
         out
+    }
+
+    /// Byte offset of every RRV entry that names a direct file position,
+    /// by identifier. Attachment objects are reached this way; notes in a
+    /// modern database mostly are not. Built once per [`Database`].
+    pub fn file_positions(&self) -> &std::collections::HashMap<u32, u64> {
+        self.file_positions.get_or_init(|| {
+            let mut m = std::collections::HashMap::new();
+            if self.header.uses_byte_positions() {
+                for bucket in self.legacy_rrv_buckets() {
+                    m.extend(bucket.entries());
+                }
+            } else if let Ok(Some((size, offsets))) = self.modern_rrv_buckets() {
+                for off in offsets {
+                    let at = off as usize;
+                    let Some(slice) = self.bytes.get(at..at.saturating_add(size)) else {
+                        continue;
+                    };
+                    let Ok((_, iter)) = RrvIter::new(slice) else {
+                        continue;
+                    };
+                    for e in iter {
+                        if let Some(b) = e.location.file_byte_offset() {
+                            m.insert(e.rrv_identifier, b);
+                        }
+                    }
+                }
+            }
+            m
+        })
+    }
+
+    /// The object an RRV identifier names: a record opening with its
+    /// signature and a u32 total size. Two shapes are known:
+    ///
+    /// - **0x0007**, payload from byte 22 (per the MIT-licensed nsf2pst
+    ///   reader). The first Notes 4 file seen has 3,436 of them and no other
+    ///   use for the signature.
+    /// - **0x001B**, payload from byte 115, with the file's SHA-1 as 40 hex
+    ///   characters at byte 24 and its size as 8 more. Measured on the 16
+    ///   attachments in the modern corpus: every object is exactly 115 bytes
+    ///   plus the declared file size, every file ends on its zip end record,
+    ///   and every SHA-1 in a header is the SHA-1 of the bytes after it.
+    pub fn object(&self, object_rrv: u32) -> Option<StoredObject<'a>> {
+        let at = *self.file_positions().get(&object_rrv)? as usize;
+        let head = self.bytes.get(at..at + 6)?;
+        let size = u32::from_le_bytes([head[2], head[3], head[4], head[5]]) as usize;
+        let record = self.bytes.get(at..at.checked_add(size)?)?;
+        match [head[0], head[1]] {
+            [0x07, 0x00] => Some(StoredObject {
+                payload: record.get(22..)?,
+                sha1: None,
+            }),
+            [0x1B, 0x00] => {
+                let digest = record.get(24..64)?;
+                Some(StoredObject {
+                    payload: record.get(115..)?,
+                    sha1: digest
+                        .iter()
+                        .all(u8::is_ascii_hexdigit)
+                        .then(|| std::str::from_utf8(digest).ok())
+                        .flatten(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Give the note's attachments their bytes from its `$FILE` objects.
+    ///
+    /// The rich text names an attached file but carries none of it; the
+    /// bytes are in the object the `$FILE` item points at. Each `$FILE` fills
+    /// the rich-text attachment of the same name that has no bytes yet, or
+    /// is added when nothing names it. One that cannot be recovered is still
+    /// listed with no bytes, which callers report as present with no content
+    /// recovered, never as an empty file.
+    fn attach_files(&self, note: &ResolvedNote, content: &mut crate::cd::NoteContent) {
+        use crate::cd::{Attachment, AttachmentKind};
+        for file in self.file_objects(note) {
+            let data = self.file_attachment(&file).unwrap_or_default();
+            let named = content.attachments.iter_mut().find(|a| {
+                a.kind == AttachmentKind::File && a.data.is_empty() && a.name.eq_ignore_ascii_case(&file.name)
+            });
+            match named {
+                Some(a) => a.data = data,
+                None => content.attachments.push(Attachment {
+                    name: file.name,
+                    data,
+                    kind: AttachmentKind::File,
+                }),
+            }
+        }
+    }
+
+    /// The bytes of one attached file, decompressed, or why they could not
+    /// be recovered.
+    ///
+    /// Accepted only when the result is exactly the size the `$FILE` item
+    /// declares, for Huffman when its byte sum matches the checksum stored
+    /// with it, and when the object records a SHA-1, when the bytes hash to
+    /// it. A file returned here is the file that was attached.
+    pub fn file_attachment(
+        &self,
+        file: &crate::item::FileObject,
+    ) -> Result<Vec<u8>, AttachmentError> {
+        let obj = self
+            .object(file.object_rrv)
+            .ok_or(AttachmentError::ObjectNotFound)?;
+        let size = file.size as usize;
+        let data = match file.compression {
+            0 => obj
+                .payload
+                .get(..size)
+                .map(<[u8]>::to_vec)
+                .ok_or(AttachmentError::Truncated)?,
+            1 => crate::huff::decompress(obj.payload, size).map_err(AttachmentError::Huffman)?,
+            other => return Err(AttachmentError::UnsupportedCompression(other)),
+        };
+        if let Some(expected) = obj.sha1 {
+            use sha1::Digest;
+            let got: String = sha1::Sha1::digest(&data)
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            if !got.eq_ignore_ascii_case(expected) {
+                return Err(AttachmentError::Sha1Mismatch);
+            }
+        }
+        Ok(data)
     }
 
     /// Parse `buf` as a note header and apply the identity gate, reporting
@@ -775,7 +991,7 @@ impl<'a> Database<'a> {
     /// On a pre-Notes 5 database the rich-text items' values are decoded
     /// directly, since there is no object wrapping them.
     pub fn note_content(&self, note: &ResolvedNote) -> Option<crate::cd::NoteContent> {
-        let content = if self.header.uses_byte_positions() {
+        let mut content = if self.header.uses_byte_positions() {
             let values: Vec<&[u8]> = self
                 .note_items_walk(note)
                 .items
@@ -786,8 +1002,11 @@ impl<'a> Database<'a> {
                 .collect();
             crate::cd::parse_items(&values)
         } else {
-            crate::cd::parse(self.non_summary_data(note)?)
+            self.non_summary_data(note)
+                .map(crate::cd::parse)
+                .unwrap_or_default()
         };
+        self.attach_files(note, &mut content);
         if content.is_empty() {
             None
         } else {

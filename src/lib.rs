@@ -65,6 +65,7 @@ pub mod database;
 pub mod detect;
 pub mod error;
 pub mod header;
+pub mod huff;
 pub mod info2;
 pub mod item;
 pub mod note;
@@ -80,14 +81,16 @@ pub use database::NonNoteRecord;
 pub use bdt::BucketDescriptorTable;
 pub use bucket::{Bucket, BucketHeader, BucketSlot};
 pub use database::{
-    Database, NoteEnumeration, ResolvedNote, WithheldEntry, WithheldLocation, WithheldReason,
+    AttachmentError, Database, NoteEnumeration, ResolvedNote, StoredObject, WithheldEntry,
+    WithheldLocation,
+    WithheldReason,
     MAX_WITHHELD_DETAIL,
 };
 pub use detect::{identify_file, FileKind};
 pub use error::NsfError;
 pub use header::DbHeader;
 pub use info2::{BdbSlot, Information2, SuperblockSlot};
-pub use item::{field_kind, parse_items, FieldKind, NoteItem};
+pub use item::{field_kind, parse_items, FieldKind, FileObject, NoteItem};
 pub use note::NoteHeader;
 pub use ods::Ods;
 pub use rrv::{LegacyRrvBucket, RrvBucketHeader, RrvEntry, RrvIter, RrvLocation};

@@ -466,6 +466,34 @@ impl NoteItem<'_> {
         Some(out.join("; "))
     }
 
+    /// Decode a `$FILE` item's value: the descriptor of a file attachment,
+    /// whose bytes live in a separate object (see
+    /// [`crate::Database::file_attachment`]).
+    ///
+    /// Layout per the MIT-licensed nsf2pst reader, the same for Notes 4 and
+    /// later: object type u16 (0 = file), object RRV u32, name length u16,
+    /// host u16, compression u16 (0 none, 1 Huffman, 2 LZ1), attributes
+    /// u16, flags u16, file size u32, created and modified TIMEDATEs, then
+    /// the name at byte 36. `None` unless the name fits inside the value.
+    pub fn as_file_object(&self) -> Option<FileObject> {
+        let v = self.data();
+        let u16_at = |o: usize| Some(u16::from_le_bytes([*v.get(o)?, *v.get(o + 1)?]));
+        let u32_at = |o: usize| Some(u32::from_le_bytes(v.get(o..o + 4)?.try_into().ok()?));
+        if u16_at(0)? != 0 {
+            return None;
+        }
+        let name_len = u16_at(6)? as usize;
+        let name = v.get(36..36 + name_len)?;
+        Some(FileObject {
+            object_rrv: u32_at(2)?,
+            compression: u16_at(10)?,
+            size: u32_at(16)?,
+            created: Timedate::from_bytes(v.get(20..28)?).ok(),
+            modified: Timedate::from_bytes(v.get(28..36)?).ok(),
+            name: String::from_utf8_lossy(name).into_owned(),
+        })
+    }
+
     /// Decode a TYPE_NOTEREF_LIST value: a `u16` count, then that many
     /// 16-byte UNIDs, rendered in the same byte order the viewer prints a
     /// note's own UNID. `None` unless the count accounts for the value
@@ -484,6 +512,23 @@ impl NoteItem<'_> {
                 .collect(),
         )
     }
+}
+
+/// A `$FILE` item: one file attachment's descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileObject {
+    /// RRV identifier of the object holding the file's bytes.
+    pub object_rrv: u32,
+    /// 0 none, 1 Huffman, 2 LZ1.
+    pub compression: u16,
+    /// The file's size once decompressed.
+    pub size: u32,
+    /// File creation time as recorded at attach time.
+    pub created: Option<Timedate>,
+    /// File modification time as recorded at attach time.
+    pub modified: Option<Timedate>,
+    /// File name as attached.
+    pub name: String,
 }
 
 /// One TIMEDATE as ISO 8601, or its hex when it is not a clock value (an
