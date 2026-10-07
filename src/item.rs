@@ -38,10 +38,11 @@ use crate::time::Timedate;
 /// On-disk size of one item descriptor.
 pub const ITEM_DESCRIPTOR_BYTES: usize = 8;
 
-/// Authoritative item data kind, derived from the field's `(item_class,
-/// item_type)` bytes in the BDB Unique Name Key table (the on-disk note
-/// item carries no inline type word). Resolve via
-/// [`crate::BucketDescriptorBlock::field_kind`].
+/// Item data kind, derived from the field's `(item_class, item_type)` bytes
+/// in the BDB Unique Name Key table. Resolve via
+/// [`crate::BucketDescriptorBlock::field_kind`]. That is the field's kind as
+/// the database first met it; a value that carries its own type word says
+/// what it actually is, and [`NoteItem::effective_kind`] lets that win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
     /// CLASS_TEXT / TYPE_TEXT.
@@ -68,6 +69,9 @@ pub enum FieldKind {
     Html,
     /// NOCOMPUTE / TYPE_MIME_PART.
     MimePart,
+    /// NOCOMPUTE / TYPE_NOTEREF_LIST: a count, then 16-byte UNIDs ($REF,
+    /// $Orig).
+    NoteRefList,
     /// Unrecognized class/type pairing.
     Unknown,
 }
@@ -88,8 +92,26 @@ impl FieldKind {
             FieldKind::Object => "Attachment / object",
             FieldKind::Html => "HTML",
             FieldKind::MimePart => "MIME part",
+            FieldKind::NoteRefList => "Note reference list",
             FieldKind::Unknown => "Unknown",
         }
+    }
+
+    /// The kind a Notes data-type word names, for the words seen on disk.
+    fn from_type_word(w: u16) -> Option<Self> {
+        Some(match w {
+            0x0001 => FieldKind::RichText,
+            0x0003 => FieldKind::Object,
+            0x0004 => FieldKind::NoteRefList,
+            0x0300 => FieldKind::Number,
+            0x0301 => FieldKind::NumberRange,
+            0x0400 => FieldKind::Time,
+            0x0401 => FieldKind::TimeRange,
+            0x0500 => FieldKind::Text,
+            0x0501 => FieldKind::TextList,
+            0x0600 | 0x0601 => FieldKind::Formula,
+            _ => return None,
+        })
     }
 }
 
@@ -114,6 +136,7 @@ pub fn field_kind(item_class: u8, item_type: u8) -> FieldKind {
         0x00 => match item_type {
             0x01 => FieldKind::RichText,
             0x03 => FieldKind::Object,
+            0x04 => FieldKind::NoteRefList,
             0x15 => FieldKind::Html,
             0x18 => FieldKind::MimePart,
             _ => FieldKind::Unknown,
@@ -137,6 +160,52 @@ pub struct NoteItem<'a> {
 }
 
 impl<'a> NoteItem<'a> {
+    /// The value's own data-type word, when it carries one.
+    ///
+    /// Item flag bit [`ITEM_NO_TYPE_WORD`] decides it. Clear, and the value
+    /// opens with its 2-byte Notes type (TYPE_TEXT_LIST 0x0501, TYPE_TIME_RANGE
+    /// 0x0401, ...); set, and the value is bare data of the field's kind.
+    /// Measured over the corpus: 92.5% of 204,401 bit-clear values open with
+    /// a known type word, against 1.3% of 969,400 bit-set ones, which is
+    /// coincidence. A Notes 4 customer's recipient fields were the visible
+    /// case: SendTo flagged 0x0045 opened `01 05` and rendered as bytes,
+    /// SendTo flagged 0x004D in another note was plain text and rendered
+    /// fine.
+    pub fn type_word(&self) -> Option<u16> {
+        if self.type_flags & ITEM_NO_TYPE_WORD != 0 {
+            return None;
+        }
+        let w = u16::from_le_bytes([*self.value.first()?, *self.value.get(1)?]);
+        FieldKind::from_type_word(w).map(|_| w)
+    }
+
+    /// The value with its type word, if any, removed: the data itself.
+    pub fn data(&self) -> &'a [u8] {
+        if self.type_word().is_some() {
+            &self.value[2..]
+        } else {
+            self.value
+        }
+    }
+
+    /// The kind to decode this value as: its own type word when it has one,
+    /// otherwise the field's kind from the name table.
+    pub fn effective_kind(&self, field: FieldKind) -> FieldKind {
+        self.type_word()
+            .and_then(FieldKind::from_type_word)
+            .unwrap_or(field)
+    }
+
+    /// The same item viewed as its data alone, so every decoder below reads
+    /// the same bytes whether or not the value carried a type word.
+    fn bare(&self) -> NoteItem<'a> {
+        NoteItem {
+            name_id: self.name_id,
+            type_flags: self.type_flags | ITEM_NO_TYPE_WORD,
+            value: self.data(),
+        }
+    }
+
     /// Decode a TYPE_TEXT_LIST value into its individual entries.
     ///
     /// On-disk layout, validated against the corpus: a `u16` entry count,
@@ -155,7 +224,7 @@ impl<'a> NoteItem<'a> {
     /// the binary prefix rendered as `.`, which is why it cannot be used to
     /// recover a recipient list.
     pub fn as_text_list(&self) -> Option<Vec<String>> {
-        let v = self.value;
+        let v = self.data();
         if v.len() < 4 {
             return None;
         }
@@ -193,20 +262,27 @@ impl<'a> NoteItem<'a> {
     /// names, addresses, e-mail) render cleanly; binary values (numbers,
     /// timedates, rich text) render as dotted placeholders. Lossless access
     /// to the original bytes is via [`Self::value`].
+    ///
+    /// Tabs and line breaks are kept: a stored header block such as
+    /// `$AdditionalHeaders` is many lines, and dotting its CR/LF out both
+    /// hid it as "binary" and ran its headers together.
     pub fn as_text(&self) -> String {
-        self.value
+        self.data()
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| match b {
+                0x20..=0x7E | b'\t' | b'\r' | b'\n' => b as char,
+                _ => '.',
+            })
             .collect()
     }
 
-    /// True if the value is entirely printable ASCII (a clean text field).
+    /// True if the value is entirely printable ASCII, tabs and line breaks
+    /// (a clean text field).
     pub fn is_printable_text(&self) -> bool {
-        !self.value.is_empty()
-            && self
-                .value
-                .iter()
-                .all(|&b| (0x20..0x7f).contains(&b) || b == b'\t')
+        let v = self.data();
+        !v.is_empty()
+            && v.iter()
+                .all(|&b| (0x20..0x7f).contains(&b) || matches!(b, b'\t' | b'\r' | b'\n'))
     }
 
     /// Best-effort human rendering of the value by shape (the on-disk note
@@ -223,6 +299,9 @@ impl<'a> NoteItem<'a> {
     /// per-field typing from the form design is a later slice). The raw
     /// bytes remain available via [`Self::value`].
     pub fn display_value(&self) -> String {
+        if self.type_word().is_some() {
+            return self.bare().display_value();
+        }
         if self.value.is_empty() {
             return String::new();
         }
@@ -291,6 +370,11 @@ impl NoteItem<'_> {
         if self.value.len() == 2 && is_type_word(u16::from_le_bytes([self.value[0], self.value[1]])) {
             return String::new();
         }
+        // A value that names its own type is decoded as that type, from the
+        // bytes after the word.
+        if self.type_word().is_some() {
+            return self.bare().render(self.effective_kind(kind));
+        }
         match kind {
             // A TEXT_LIST decodes to its entries when the on-disk lengths fit
             // exactly; joining with "; " keeps a multi-recipient field
@@ -311,6 +395,16 @@ impl NoteItem<'_> {
                     hex_summary(self.value)
                 }
             }
+            FieldKind::NumberRange if self.as_range(fmt_number).is_some() => {
+                self.as_range(fmt_number).unwrap_or_default()
+            }
+            FieldKind::TimeRange if self.as_range(fmt_time).is_some() => {
+                self.as_range(fmt_time).unwrap_or_default()
+            }
+            FieldKind::NoteRefList => self
+                .as_note_refs()
+                .map(|r| r.join("; "))
+                .unwrap_or_else(|| hex_summary(self.value)),
             FieldKind::Number | FieldKind::NumberRange => {
                 if self.value.len() >= 8 {
                     let b: [u8; 8] = self.value[..8].try_into().expect("len checked");
@@ -342,6 +436,73 @@ impl NoteItem<'_> {
             FieldKind::Object => "(attachment / object)".to_string(),
             FieldKind::Unknown => self.display_value(),
         }
+    }
+
+    /// Decode a Notes RANGE value (TIME_RANGE, NUMBER_RANGE): a `u16` count
+    /// of single entries and a `u16` count of pairs, then the singles, then
+    /// the pairs, each entry 8 bytes. Pairs render as `a - b`; everything is
+    /// joined with `; `. `None` unless the counts account for the value
+    /// exactly, as with [`Self::as_text_list`].
+    ///
+    /// The customer's RouteTimes values are the shape: `00 00 02 00` (no
+    /// singles, two pairs) then four TIMEDATEs, 36 bytes.
+    pub fn as_range(&self, entry: fn(&[u8]) -> String) -> Option<String> {
+        let v = self.data();
+        let singles = u16::from_le_bytes([*v.first()?, *v.get(1)?]) as usize;
+        let pairs = u16::from_le_bytes([*v.get(2)?, *v.get(3)?]) as usize;
+        if singles + pairs == 0 || 4 + singles * 8 + pairs * 16 != v.len() {
+            return None;
+        }
+        let mut out: Vec<String> = Vec::with_capacity(singles + pairs);
+        let body = &v[4..];
+        for k in 0..singles {
+            out.push(entry(&body[k * 8..k * 8 + 8]));
+        }
+        let pair_base = singles * 8;
+        for k in 0..pairs {
+            let o = pair_base + k * 16;
+            out.push(format!("{} - {}", entry(&body[o..o + 8]), entry(&body[o + 8..o + 16])));
+        }
+        Some(out.join("; "))
+    }
+
+    /// Decode a TYPE_NOTEREF_LIST value: a `u16` count, then that many
+    /// 16-byte UNIDs, rendered in the same byte order the viewer prints a
+    /// note's own UNID. `None` unless the count accounts for the value
+    /// exactly. A customer's $Orig was `01 00` and then exactly the UNID the
+    /// viewer showed for that note.
+    pub fn as_note_refs(&self) -> Option<Vec<String>> {
+        let v = self.data();
+        let count = u16::from_le_bytes([*v.first()?, *v.get(1)?]) as usize;
+        if count == 0 || 2 + count * 16 != v.len() {
+            return None;
+        }
+        Some(
+            v[2..]
+                .chunks_exact(16)
+                .map(|u| u.iter().map(|b| format!("{b:02X}")).collect())
+                .collect(),
+        )
+    }
+}
+
+/// One TIMEDATE as ISO 8601, or its hex when it is not a clock value (an
+/// all-zero entry, for instance, which some list items carry as a slot).
+fn fmt_time(b: &[u8]) -> String {
+    Timedate::from_bytes(b)
+        .ok()
+        .and_then(|t| t.as_clock())
+        .map(|c| c.to_iso_8601())
+        .unwrap_or_else(|| hex_summary(b))
+}
+
+/// One IEEE-754 double, as an integer when it is one.
+fn fmt_number(b: &[u8]) -> String {
+    let f = f64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+    if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e15 {
+        format!("{}", f as i64)
+    } else {
+        format!("{f}")
     }
 }
 
@@ -538,6 +699,11 @@ pub fn walk_items_at<'a>(
 /// non-summary data. Its absence means the value was never in this record to
 /// be found.
 pub const ITEM_SUMMARY: u16 = 0x0004;
+
+/// Field flag: the value is bare data of the field's kind. When clear, the
+/// value opens with its own 2-byte data-type word. See
+/// [`NoteItem::type_word`] for the measurement this rests on.
+pub const ITEM_NO_TYPE_WORD: u16 = 0x0008;
 
 /// Field flag: name the item in the item table, but store no value for it.
 pub const ITEM_PLACEHOLDER: u16 = 0x0100;
@@ -751,6 +917,108 @@ mod tests {
         assert_eq!(w.unreached.len(), 1);
         assert_eq!(w.unreached[0].name_id, 0x7E);
         assert_eq!(w.unreached[0].reason, UnreachedReason::ValueInNonSummary);
+    }
+}
+
+/// Values shaped like the ones a Notes 4 customer sent from their own
+/// mailbox (same flags, same layouts; names replaced).
+#[cfg(test)]
+mod typed_value_tests {
+    use super::*;
+
+    fn item(flags: u16, value: &[u8]) -> NoteItem<'_> {
+        NoteItem { name_id: 0x67, type_flags: flags, value }
+    }
+
+    fn text_list(type_word: bool, names: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        if type_word {
+            v.extend_from_slice(&0x0501u16.to_le_bytes());
+        }
+        v.extend_from_slice(&(names.len() as u16).to_le_bytes());
+        for n in names {
+            v.extend_from_slice(&(n.len() as u16).to_le_bytes());
+        }
+        for n in names {
+            v.extend_from_slice(n.as_bytes());
+        }
+        v
+    }
+
+    /// SendTo flagged 0x0045 opens with TYPE_TEXT_LIST although the field
+    /// table calls SendTo Text. The value's own word has to win, or a
+    /// multi-recipient field renders as bytes.
+    #[test]
+    fn a_value_that_names_its_type_is_decoded_as_that_type() {
+        let v = text_list(true, &["CN=Ann Example/O=ACME@ACME", "CN=Bob Sample/O=ACME@ACME"]);
+        let it = item(0x0045, &v);
+        assert_eq!(it.type_word(), Some(0x0501));
+        assert_eq!(it.effective_kind(FieldKind::Text), FieldKind::TextList);
+        assert_eq!(
+            it.render(FieldKind::Text),
+            "CN=Ann Example/O=ACME@ACME; CN=Bob Sample/O=ACME@ACME"
+        );
+        assert_eq!(it.as_text_list().unwrap().len(), 2);
+    }
+
+    /// The same field flagged 0x004D is bare text, and a value that happens
+    /// to start like a type word must not be cut when the flag says there is
+    /// none.
+    #[test]
+    fn bit_0x0008_means_bare_data() {
+        let it = item(0x004D, b"ALL_STAFF");
+        assert_eq!(it.type_word(), None);
+        assert_eq!(it.render(FieldKind::Text), "ALL_STAFF");
+        let lookalike = [0x01, 0x05, b'x', b'y'];
+        assert_eq!(item(0x000C, &lookalike).data(), &lookalike[..]);
+        let plain = text_list(false, &["one", "two"]);
+        assert_eq!(item(0x000C, &plain).render(FieldKind::TextList), "one; two");
+    }
+
+    #[test]
+    fn time_ranges_decode_singles_and_pairs() {
+        let t1 = [0x30, 0xF8, 0x7C, 0x00, 0x2B, 0x6D, 0x25, 0x4A];
+        let t2 = [0xE0, 0x16, 0x81, 0x00, 0x2B, 0x6D, 0x25, 0x4A];
+        // TimeRange, flagged 0x0004: type word, no singles, one pair.
+        let mut v = 0x0401u16.to_le_bytes().to_vec();
+        v.extend_from_slice(&[0, 0, 1, 0]);
+        v.extend_from_slice(&t1);
+        v.extend_from_slice(&t2);
+        let r = item(0x0004, &v).render(FieldKind::Time);
+        assert!(r.starts_with("2003-") && r.contains(" - 2003-"), "{r}");
+        // RouteTimes, flagged 0x0008: bare, two pairs.
+        let mut v = vec![0, 0, 2, 0];
+        for t in [t1, t2, t1, t2] {
+            v.extend_from_slice(&t);
+        }
+        let r = item(0x0008, &v).render(FieldKind::TimeRange);
+        assert_eq!(r.matches(" - ").count(), 2, "{r}");
+        assert_eq!(r.matches("; ").count(), 1, "{r}");
+        // Counts that do not fit fall back rather than misread.
+        assert!(item(0x0008, &v[..30]).as_range(fmt_time).is_none());
+    }
+
+    #[test]
+    fn a_note_reference_list_is_its_unids() {
+        let mut v = vec![1, 0];
+        v.extend_from_slice(&[0x80, 0x37, 0x2C, 0x0A, 0x9F, 0x01, 0x25, 0xE7]);
+        v.extend_from_slice(&[0x58, 0x10, 0x0E, 0x00, 0x26, 0x6D, 0x25, 0x4A]);
+        assert_eq!(field_kind(0x00, 0x04), FieldKind::NoteRefList);
+        assert_eq!(
+            item(0x000C, &v).render(FieldKind::NoteRefList),
+            "80372C0A9F0125E758100E00266D254A"
+        );
+    }
+
+    /// A stored header block is text with line breaks, and must render as
+    /// text rather than as "binary".
+    #[test]
+    fn multi_line_text_stays_text() {
+        let v = b"Received: from a.example ([192.0.2.1])\r\n by b.example; Tue, 3 Jun 2003\r\nX-Mailer: test\r\n";
+        let it = item(0x0008, v);
+        assert!(it.is_printable_text());
+        let r = it.render(FieldKind::Text);
+        assert!(r.contains("Received: from a.example") && r.contains("\r\nX-Mailer: test"), "{r}");
     }
 }
 
@@ -1461,8 +1729,10 @@ mod overflow_diagnostics {
 mod text_list_tests {
     use super::*;
 
+    /// Bare values, flagged as such (summary, no type word), the way the
+    /// corpus values these tests mirror are stored.
     fn item(value: &[u8]) -> NoteItem<'_> {
-        NoteItem { name_id: 0, type_flags: 0, value }
+        NoteItem { name_id: 0, type_flags: ITEM_SUMMARY | ITEM_NO_TYPE_WORD, value }
     }
 
     /// Build a well-formed TEXT_LIST value from entries.
