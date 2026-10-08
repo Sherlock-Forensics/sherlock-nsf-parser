@@ -2,9 +2,9 @@
 //!
 //! A note's non-summary data object (see [`crate::Database::non_summary_data`])
 //! is a CD-record stream that begins after the object's fixed 68-byte header.
-//! CD records carry the rich-text `$Body` (CDTEXT records) and embedded
-//! file/image attachments (CDFILEHEADER/CDFILESEGMENT, CDIMAGEHEADER/
-//! CDIMAGESEGMENT).
+//! CD records carry the rich-text `$Body` (CDTEXT records), embedded images
+//! (CDIMAGEHEADER/CDIMAGESEGMENT) and the icons of attached files
+//! (CDHOTSPOTBEGIN of type file, whose bytes are in a `$FILE` object).
 //!
 //! CD records are NOT part of libnsfdb (which is container-level only); this
 //! was reverse-engineered against fakenames.nsf and cross-checked with the HCL
@@ -37,8 +37,10 @@ const SIG_TEXT: u8 = 0x85;
 const SIG_PARAGRAPH: u8 = 0x6D;
 const SIG_IMAGEHEADER: u8 = 0x7D;
 const SIG_IMAGESEGMENT: u8 = 0x7C;
-const SIG_FILEHEADER: u8 = 0xA9;
-const SIG_FILESEGMENT: u8 = 0xAA;
+/// CDHOTSPOTBEGIN: a link, button, popup, section or attached file.
+const SIG_HOTSPOTBEGIN: u8 = 0xA9;
+/// CDHOTSPOTBEGIN type of an attached file's icon.
+const HOTSPOT_TYPE_FILE: u16 = 4;
 
 /// One CD record: its signature byte and the bytes after the framing header.
 #[derive(Debug, Clone, Copy)]
@@ -95,24 +97,23 @@ fn walk_from(obj: &[u8], start: usize) -> Vec<CdRecord<'_>> {
 pub enum AttachmentKind {
     /// Embedded image (CDIMAGEHEADER/CDIMAGESEGMENT).
     Image,
-    /// File attachment (CDFILEHEADER/CDFILESEGMENT).
+    /// File attachment (a file hotspot, filled from its `$FILE` object).
     File,
 }
 
 /// A reconstructed attachment: suggested name + raw bytes.
 #[derive(Debug, Clone)]
 pub struct Attachment {
-    /// File name (from CDFILEHEADER) or a synthesized `image_N.ext`.
+    /// The file's name as attached (the name its `$FILE` item carries) or
+    /// a synthesized `image_N.ext`.
     pub name: String,
     /// Reassembled bytes.
     ///
-    /// Empty when the CD stream names a file but carries none of it. That
-    /// is not a decoding failure: measured on fakenames.nsf, those notes'
-    /// CDFILESEGMENT records have zero-length bodies, so the bytes are not
-    /// in the rich-text stream at all - Notes keeps the attachment in a
-    /// separate file object, which this build does not yet resolve. A
-    /// consumer must report such an attachment as PRESENT WITH NO CONTENT
-    /// RECOVERED, never as an empty file.
+    /// Empty when the rich text names a file whose bytes were not
+    /// recovered: the rich text only carries the file's icon, and the bytes
+    /// come from the `$FILE` object of the same name, which may be absent
+    /// or undecodable. A consumer must report such an attachment as PRESENT
+    /// WITH NO CONTENT RECOVERED, never as an empty file.
     pub data: Vec<u8>,
     /// Image vs file.
     pub kind: AttachmentKind,
@@ -240,23 +241,23 @@ fn image_ext(image_type: u16, data: &[u8]) -> &'static str {
     image_ext_from_magic(data).unwrap_or_else(|| image_ext_from_type(image_type))
 }
 
-/// First >= 3-char printable run in a CDFILEHEADER body (the file name).
-fn file_name(body: &[u8]) -> Option<String> {
-    let mut i = 0;
-    while i < body.len() {
-        if body[i].is_ascii_graphic() || body[i] == b' ' {
-            let s = i;
-            while i < body.len() && (body[i].is_ascii_graphic() || body[i] == b' ') {
-                i += 1;
-            }
-            if i - s >= 3 {
-                return Some(String::from_utf8_lossy(&body[s..i]).into_owned());
-            }
-        } else {
-            i += 1;
-        }
+/// The file a CDHOTSPOTBEGIN body names, or `None` for any other hotspot.
+///
+/// Body: type u16, flags u32, data length u16, then for a file two
+/// NUL-terminated strings, the unique name (its `$FILE` item's name) and
+/// the name it was attached under. Measured on fakenames.nsf, where every
+/// file hotspot is `test<digits>.bin` twice. Notes gives a second file of
+/// the same name in one note a generated unique name, so the unique name is
+/// what ties the icon to its bytes.
+fn hotspot_file_name(body: &[u8]) -> Option<String> {
+    if u16::from_le_bytes([*body.first()?, *body.get(1)?]) != HOTSPOT_TYPE_FILE {
+        return None;
     }
-    None
+    let len = u16::from_le_bytes([*body.get(6)?, *body.get(7)?]) as usize;
+    let data = body.get(8..)?;
+    let data = &data[..len.min(data.len())];
+    let unique = data.split(|&b| b == 0).next()?;
+    (!unique.is_empty()).then(|| String::from_utf8_lossy(unique).into_owned())
 }
 
 /// Parse a non-summary object into its rich-text body + attachments.
@@ -365,15 +366,11 @@ fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
                     }
                 }
             }
-            SIG_FILEHEADER => {
-                finish_image(&mut content, cur_image.take(), &mut img_n);
-                finish_file(&mut content, cur_file.take());
-                let name = file_name(r.body).unwrap_or_else(|| "attachment.bin".to_string());
-                cur_file = Some((name, Vec::new()));
-            }
-            SIG_FILESEGMENT => {
-                if let Some((_, data)) = cur_file.as_mut() {
-                    data.extend_from_slice(r.body);
+            SIG_HOTSPOTBEGIN => {
+                if let Some(name) = hotspot_file_name(r.body) {
+                    finish_image(&mut content, cur_image.take(), &mut img_n);
+                    finish_file(&mut content, cur_file.take());
+                    cur_file = Some((name, Vec::new()));
                 }
             }
             _ => {}
@@ -497,48 +494,47 @@ mod run_tests {
         }
     }
 
-    /// Pin the measured shape of a name-only attachment, so the doc claim
-    /// above cannot drift back to "an encoding we cannot decode".
-    #[test]
-    fn a_file_segment_with_no_body_yields_a_named_attachment_with_no_bytes() {
-        // A CD stream with a file header and an EMPTY segment, which is what
-        // fakenames.nsf actually carries for six attachments.
-        let mut obj = vec![0u8; CD_STREAM_START];
-        // CDFILEHEADER, BSIG framing: [sig][len][body...]
-        let name = b"report.bin";
-        let mut header_body = vec![0u8; 8];
-        header_body.extend_from_slice(name);
-        obj.push(SIG_FILEHEADER);
-        obj.push((2 + header_body.len()) as u8);
-        obj.extend_from_slice(&header_body);
-        // CDFILESEGMENT with a zero-length body.
-        obj.push(SIG_FILESEGMENT);
-        obj.push(2);
+    fn hotspot(kind: u16, data: &[u8]) -> Vec<u8> {
+        // WSIG framing: [sig][0xFF][len u16][type u16][flags u32][len u16][data]
+        let mut body = kind.to_le_bytes().to_vec();
+        body.extend_from_slice(&9u32.to_le_bytes());
+        body.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        body.extend_from_slice(data);
+        let mut rec = vec![SIG_HOTSPOTBEGIN, 0xFF];
+        rec.extend_from_slice(&((4 + body.len()) as u16).to_le_bytes());
+        rec.extend_from_slice(&body);
+        if rec.len() % 2 == 1 {
+            rec.push(0);
+        }
+        rec
+    }
 
+    /// The shape fakenames.nsf carries: the icon names the file and holds
+    /// none of it. The bytes come from the `$FILE` object.
+    #[test]
+    fn a_file_hotspot_names_its_file_by_its_unique_name() {
+        let mut obj = vec![0u8; CD_STREAM_START];
+        obj.extend(hotspot(HOTSPOT_TYPE_FILE, b"ATT12345.xls\0Budget.xls\0"));
+        obj.extend([0xAA, 2]); // CDHOTSPOTEND
         let content = parse(&obj);
         assert_eq!(content.attachments.len(), 1);
         let a = &content.attachments[0];
-        assert_eq!(a.name, "report.bin");
-        assert!(a.data.is_empty(), "there were no bytes to recover");
+        assert_eq!(a.name, "ATT12345.xls");
+        assert!(a.data.is_empty(), "the icon carries no bytes");
         assert_eq!(a.kind, AttachmentKind::File);
     }
 
+    /// A customer's Notes 4 mail file reported 8,450 attachments with no
+    /// bytes against 3,140 `$FILE` items: every doc link, button and popup
+    /// was being listed as a file.
     #[test]
-    fn a_file_segment_with_a_body_recovers_its_bytes() {
+    fn other_hotspots_are_not_attachments() {
         let mut obj = vec![0u8; CD_STREAM_START];
-        let mut header_body = vec![0u8; 8];
-        header_body.extend_from_slice(b"note.txt");
-        obj.push(SIG_FILEHEADER);
-        obj.push((2 + header_body.len()) as u8);
-        obj.extend_from_slice(&header_body);
-        let payload = b"hello world";
-        obj.push(SIG_FILESEGMENT);
-        obj.push((2 + payload.len()) as u8);
-        obj.extend_from_slice(payload);
-
-        let content = parse(&obj);
-        assert_eq!(content.attachments.len(), 1);
-        assert_eq!(content.attachments[0].data, payload.to_vec());
+        for kind in [1u16, 3, 7, 11, 13] {
+            obj.extend(hotspot(kind, b"https://example.invalid\0"));
+            obj.extend([0xAA, 2]);
+        }
+        assert!(parse(&obj).attachments.is_empty());
     }
 
     #[test]
@@ -621,3 +617,4 @@ mod run_tests {
         assert!(notes_with_body > 0, "the corpus should hold rich-text bodies");
     }
 }
+

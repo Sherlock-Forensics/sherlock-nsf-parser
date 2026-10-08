@@ -553,6 +553,7 @@ impl NoteItem<'_> {
             created: Timedate::from_bytes(v.get(20..28)?).ok(),
             modified: Timedate::from_bytes(v.get(28..36)?).ok(),
             name: String::from_utf8_lossy(name).into_owned(),
+            encrypted: self.type_flags & ITEM_SEAL != 0,
         })
     }
 
@@ -591,6 +592,10 @@ pub struct FileObject {
     pub modified: Option<Timedate>,
     /// File name as attached.
     pub name: String,
+    /// The item is sealed ([`ITEM_SEAL`]): the object holds the file
+    /// encrypted to the recipients' Notes IDs, and the descriptor alone is
+    /// readable.
+    pub encrypted: bool,
 }
 
 /// One TIMEDATE as ISO 8601, or its hex when it is not a clock value (an
@@ -812,6 +817,10 @@ pub fn walk_items_at<'a>(
 /// non-summary data. Its absence means the value was never in this record to
 /// be found.
 pub const ITEM_SUMMARY: u16 = 0x0004;
+
+/// Field flag: the value is sealed (encrypted). On a `$FILE` the
+/// descriptor stays in the clear and the object it names is encrypted.
+pub const ITEM_SEAL: u16 = 0x0002;
 
 /// Field flag: the value is bare data of the field's kind. When clear, the
 /// value opens with its own 2-byte data-type word. See
@@ -1056,6 +1065,29 @@ mod typed_value_tests {
             v.extend_from_slice(n.as_bytes());
         }
         v
+    }
+
+    fn file_value(name: &str) -> Vec<u8> {
+        let mut v = vec![0u8; 36];
+        v[2..6].copy_from_slice(&52654u32.to_le_bytes());
+        v[6..8].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        v[10..12].copy_from_slice(&1u16.to_le_bytes());
+        v[16..20].copy_from_slice(&5131u32.to_le_bytes());
+        v.extend_from_slice(name.as_bytes());
+        v
+    }
+
+    /// A sealed `$FILE` keeps its descriptor readable; only the object is
+    /// encrypted. The flag is what lets a failure say so.
+    #[test]
+    fn a_sealed_file_item_is_marked_encrypted() {
+        let v = file_value("Budget.xls");
+        let plain = item(ITEM_NO_TYPE_WORD, &v).as_file_object().expect("descriptor");
+        assert!(!plain.encrypted);
+        assert_eq!((plain.object_rrv, plain.size, plain.name.as_str()), (52654, 5131, "Budget.xls"));
+        let sealed = item(ITEM_NO_TYPE_WORD | ITEM_SEAL, &v).as_file_object().expect("descriptor");
+        assert!(sealed.encrypted);
+        assert_eq!(sealed.name, "Budget.xls");
     }
 
     /// SendTo flagged 0x0045 opens with TYPE_TEXT_LIST although the field

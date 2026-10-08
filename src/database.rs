@@ -71,6 +71,10 @@ pub enum AttachmentError {
     /// The object records the file's SHA-1 and the recovered bytes do not
     /// match it.
     Sha1Mismatch,
+    /// The `$FILE` item is sealed and its object did not decode: the file
+    /// is encrypted to the recipients' Notes IDs, which a reader of the
+    /// database alone does not hold.
+    Encrypted,
 }
 
 /// An object record's payload, and the SHA-1 it records for its file when
@@ -126,6 +130,21 @@ impl<'a> Database<'a> {
             .filter(|it| ids.contains(&it.name_id))
             .filter_map(|it| it.as_file_object())
             .collect()
+    }
+
+    /// How many of the note's `$FILE` items are not a file descriptor this
+    /// build reads (another object type, or a value that does not fit). An
+    /// object only such an item points at shows as unreferenced.
+    pub fn undecoded_file_items(&self, note: &ResolvedNote) -> usize {
+        let ids = self.file_name_ids();
+        if ids.is_empty() {
+            return 0;
+        }
+        self.note_items_walk(note)
+            .items
+            .iter()
+            .filter(|it| ids.contains(&it.name_id) && it.as_file_object().is_none())
+            .count()
     }
 
     /// Parsed database header.
@@ -775,7 +794,9 @@ impl<'a> Database<'a> {
     /// Accepted only when the result is exactly the size the `$FILE` item
     /// declares, for Huffman when its byte sum matches the checksum stored
     /// with it, and when the object records a SHA-1, when the bytes hash to
-    /// it. A file returned here is the file that was attached.
+    /// it. A file returned here is the file that was attached. A sealed
+    /// item whose object does not decode is reported as encrypted: Huffman
+    /// is tried first, so a sealed flag never costs a readable file.
     pub fn file_attachment(
         &self,
         file: &crate::item::FileObject,
@@ -783,6 +804,18 @@ impl<'a> Database<'a> {
         let obj = self
             .object(file.object_rrv)
             .ok_or(AttachmentError::ObjectNotFound)?;
+        let data = self.decode_object(file, obj);
+        if file.encrypted && data.is_err() {
+            return Err(AttachmentError::Encrypted);
+        }
+        data
+    }
+
+    fn decode_object(
+        &self,
+        file: &crate::item::FileObject,
+        obj: StoredObject<'_>,
+    ) -> Result<Vec<u8>, AttachmentError> {
         let size = file.size as usize;
         let data = match file.compression {
             0 => obj
