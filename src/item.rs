@@ -72,6 +72,9 @@ pub enum FieldKind {
     /// NOCOMPUTE / TYPE_NOTEREF_LIST: a count, then 16-byte UNIDs ($REF,
     /// $Orig).
     NoteRefList,
+    /// NOCOMPUTE / TYPE_NOTELINK_LIST: a count, then 40-byte doc links
+    /// ($Links).
+    NoteLinkList,
     /// Unrecognized class/type pairing.
     Unknown,
 }
@@ -93,6 +96,7 @@ impl FieldKind {
             FieldKind::Html => "HTML",
             FieldKind::MimePart => "MIME part",
             FieldKind::NoteRefList => "Note reference list",
+            FieldKind::NoteLinkList => "Doc link list",
             FieldKind::Unknown => "Unknown",
         }
     }
@@ -103,6 +107,7 @@ impl FieldKind {
             0x0001 => FieldKind::RichText,
             0x0003 => FieldKind::Object,
             0x0004 => FieldKind::NoteRefList,
+            0x0007 => FieldKind::NoteLinkList,
             0x0300 => FieldKind::Number,
             0x0301 => FieldKind::NumberRange,
             0x0400 => FieldKind::Time,
@@ -137,6 +142,7 @@ pub fn field_kind(item_class: u8, item_type: u8) -> FieldKind {
             0x01 => FieldKind::RichText,
             0x03 => FieldKind::Object,
             0x04 => FieldKind::NoteRefList,
+            0x07 => FieldKind::NoteLinkList,
             0x15 => FieldKind::Html,
             0x18 => FieldKind::MimePart,
             _ => FieldKind::Unknown,
@@ -391,6 +397,8 @@ impl NoteItem<'_> {
             | FieldKind::MimePart => {
                 if self.is_printable_text() {
                     self.as_text()
+                } else if let Some(t) = self.as_multiline_text() {
+                    t
                 } else {
                     hex_summary(self.value)
                 }
@@ -403,6 +411,10 @@ impl NoteItem<'_> {
             }
             FieldKind::NoteRefList => self
                 .as_note_refs()
+                .map(|r| r.join("; "))
+                .unwrap_or_else(|| hex_summary(self.value)),
+            FieldKind::NoteLinkList => self
+                .as_note_links()
                 .map(|r| r.join("; "))
                 .unwrap_or_else(|| hex_summary(self.value)),
             FieldKind::Number | FieldKind::NumberRange => {
@@ -464,6 +476,56 @@ impl NoteItem<'_> {
             out.push(format!("{} - {}", entry(&body[o..o + 8]), entry(&body[o + 8..o + 16])));
         }
         Some(out.join("; "))
+    }
+
+    /// Text whose line breaks are stored as NUL bytes, the way a Notes text
+    /// item separates lines. A customer's `$AdditionalHeaders` - a stored
+    /// header block - still rendered as hex after CR/LF was allowed, and NUL
+    /// line separators are the remaining non-printable byte a header block
+    /// would hold. A value qualifies when at least 90% of it is printable or
+    /// a line break, it holds a line of text, and it does not open with a
+    /// NUL; any other control byte (an LMBCS character-set prefix, say)
+    /// renders as `.` rather than sending the whole value to hex. Binary
+    /// values sit nowhere near 90% printable.
+    pub fn as_multiline_text(&self) -> Option<String> {
+        let v = self.data();
+        let printable = v.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count();
+        let texty = v
+            .iter()
+            .filter(|&&b| (0x20..0x7f).contains(&b) || matches!(b, 0 | b'\t' | b'\r' | b'\n'))
+            .count();
+        if printable < 8 || texty * 10 < v.len() * 9 || v.first() == Some(&0) {
+            return None;
+        }
+        let text: String = v
+            .iter()
+            .map(|&b| match b {
+                0 => '\n',
+                0x20..=0x7E | b'\t' | b'\r' | b'\n' => b as char,
+                _ => '.',
+            })
+            .collect();
+        Some(text.trim_end_matches('\n').to_string())
+    }
+
+    /// Decode a TYPE_NOTELINK_LIST value (`$Links`): a `u16` count, then
+    /// 40-byte doc links - replica ID (8 bytes), view UNID (16), note UNID
+    /// (16) - rendered in the byte order the viewer prints UNIDs. `None`
+    /// unless the count accounts for the value exactly. A customer's
+    /// `$Links` was count 4 and 162 bytes, which is 2 + 4 * 40.
+    pub fn as_note_links(&self) -> Option<Vec<String>> {
+        let v = self.data();
+        let count = u16::from_le_bytes([*v.first()?, *v.get(1)?]) as usize;
+        if count == 0 || 2 + count * 40 != v.len() {
+            return None;
+        }
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+        Some(
+            v[2..]
+                .chunks_exact(40)
+                .map(|l| format!("replica {} view {} note {}", hex(&l[..8]), hex(&l[8..24]), hex(&l[24..])))
+                .collect(),
+        )
     }
 
     /// Decode a `$FILE` item's value: the descriptor of a file attachment,
@@ -534,6 +596,12 @@ pub struct FileObject {
 /// One TIMEDATE as ISO 8601, or its hex when it is not a clock value (an
 /// all-zero entry, for instance, which some list items carry as a slot).
 fn fmt_time(b: &[u8]) -> String {
+    // An all-zero entry is an unset slot - most $Revisions values open with
+    // one - and is said to be empty rather than printed as eight zero bytes
+    // that read like a decoding failure.
+    if b.iter().all(|&x| x == 0) {
+        return "(empty)".to_string();
+    }
     Timedate::from_bytes(b)
         .ok()
         .and_then(|t| t.as_clock())
@@ -1064,6 +1132,40 @@ mod typed_value_tests {
         assert!(it.is_printable_text());
         let r = it.render(FieldKind::Text);
         assert!(r.contains("Received: from a.example") && r.contains("\r\nX-Mailer: test"), "{r}");
+    }
+
+    /// Notes separates the lines of a text item with NUL. A header block
+    /// stored that way is text, one header per line.
+    #[test]
+    fn nul_separated_lines_are_text() {
+        let v = b"Received: from a.example by b.example\0X-Mailer: test\0";
+        let r = item(0x0008, v).render(FieldKind::Text);
+        assert_eq!(r, "Received: from a.example by b.example\nX-Mailer: test");
+        // Binary with a few zeros is not mistaken for it.
+        assert!(item(0x0008, &[0, 1, 2, 0, 9]).as_multiline_text().is_none());
+    }
+
+    #[test]
+    fn a_doc_link_list_is_its_links() {
+        let mut v = vec![1, 0];
+        v.extend_from_slice(&[0x11; 8]);
+        v.extend_from_slice(&[0x22; 16]);
+        v.extend_from_slice(&[0x33; 16]);
+        assert_eq!(field_kind(0x00, 0x07), FieldKind::NoteLinkList);
+        let r = item(0x0008, &v).render(FieldKind::NoteLinkList);
+        assert_eq!(
+            r,
+            format!("replica {} view {} note {}", "11".repeat(8), "22".repeat(16), "33".repeat(16))
+        );
+        assert!(item(0x0008, &v[..41]).as_note_links().is_none());
+    }
+
+    /// Most $Revisions values hold one all-zero entry. It is an empty slot,
+    /// and says so rather than printing as bytes.
+    #[test]
+    fn an_all_zero_date_is_empty() {
+        let v = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(item(0x000C, &v).render(FieldKind::TimeRange), "(empty)");
     }
 }
 

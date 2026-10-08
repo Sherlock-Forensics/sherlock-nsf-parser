@@ -966,6 +966,27 @@ impl<'a> Database<'a> {
         self.bytes.get(start..end)
     }
 
+    /// On a pre-Notes 5 database, whether the note's non-summary items'
+    /// declared sizes add up to the size its header gives - the check that
+    /// decides whether its body and non-summary fields (a `$FILE` among
+    /// them) are read. `None` when the note has no non-summary data or the
+    /// database is modern. Counted by support reports, to say how often the
+    /// check refused.
+    pub fn legacy_non_summary_accounts(&self, note: &ResolvedNote) -> Option<bool> {
+        if !self.header.uses_byte_positions()
+            || note.header.non_summary_data_identifier == 0
+            || note.header.non_summary_data_size == 0
+        {
+            return None;
+        }
+        let declared = crate::item::non_summary_total(
+            self.record(note)?,
+            note.header.number_of_note_items,
+            crate::note::LEGACY_NOTE_HEADER_BYTES,
+        )?;
+        Some(declared == note.header.non_summary_data_size as usize)
+    }
+
     /// Pre-Notes 5 non-summary data: see [`Self::non_summary_data`].
     fn legacy_non_summary(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
         let size = note.header.non_summary_data_size as usize;
