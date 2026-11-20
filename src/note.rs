@@ -73,6 +73,11 @@ pub const LEGACY_NOTE_HEADER_BYTES: usize = 84;
 /// bytes silently withheld them from enumeration.
 pub const NOTE_HEADER_SHORT_BYTES: usize = 64;
 
+/// Status flag of a response-parent placeholder: a note record that stands
+/// in for a parent document the database does not hold. See
+/// [`NoteHeader::is_placeholder`].
+pub const STATUS_PLACEHOLDER: u16 = 0x0040;
+
 /// Note class flag values. A note's `note_class` is typically one of
 /// these; multi-bit values are uncommon in practice.
 #[allow(missing_docs)]
@@ -227,6 +232,48 @@ impl NoteHeader {
         self.note_class & class::DOCUMENT != 0
     }
 
+    /// True for a response-parent placeholder: a record that holds a place
+    /// in the response hierarchy for a parent document whose content is not
+    /// in this database, typically because a selective replica received the
+    /// responses but not the parent.
+    ///
+    /// Such a record carries the parent's UNID, status flag
+    /// [`STATUS_PLACEHOLDER`], no items, a response count of one or more,
+    /// and after the header the response notes' RRV identifiers (see
+    /// [`Self::placeholder_responses`]). Measured on a selective
+    /// replica: 19 such records, every one item-less with that flag set and
+    /// every response's `$REF` naming the placeholder's UNID; 18 with
+    /// sequence number 0 and an all-zero sequence time, as no version of the
+    /// parent was ever received. None of 9,082 content notes sampled from
+    /// the same file carries the flag.
+    ///
+    /// A placeholder is not a document whose fields went unread: its fields
+    /// were never in the file. A caller should say so rather than present
+    /// an empty document.
+    pub fn is_placeholder(&self) -> bool {
+        self.status_flags & STATUS_PLACEHOLDER != 0 && self.number_of_note_items == 0
+    }
+
+    /// The RRV identifiers of a placeholder's responses, read from its
+    /// record (`record` starting at the note header): `number_of_responses`
+    /// u32 values right after the 100-byte header. Empty for a note that is
+    /// not a placeholder or a record too short to hold them all; a record
+    /// may carry zero padding after them.
+    pub fn placeholder_responses(&self, record: &[u8]) -> Vec<u32> {
+        if !self.is_placeholder() {
+            return Vec::new();
+        }
+        let n = usize::from(self.number_of_responses);
+        record
+            .get(NOTE_HEADER_BYTES..NOTE_HEADER_BYTES + n * 4)
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// True if the note carries any design-related class bit (FORM,
     /// VIEW, ICON, DESIGN, HELP, FILTER, FIELD, REPLFORMULA, PRIVATE).
     pub fn is_design(&self) -> bool {
@@ -339,6 +386,38 @@ mod tests {
         let mut buf = synthetic_note(class::DOCUMENT, 1);
         buf[0] = 0xFF;
         assert!(NoteHeader::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn an_item_less_note_with_the_placeholder_flag_is_a_placeholder() {
+        let mut buf = synthetic_note(class::DOCUMENT, 0);
+        buf[38..40].copy_from_slice(&STATUS_PLACEHOLDER.to_le_bytes());
+        assert!(NoteHeader::parse(&buf).unwrap().is_placeholder());
+
+        // The flag alone, on a note that has items, is not a placeholder.
+        let mut with_items = synthetic_note(class::DOCUMENT, 3);
+        with_items[38..40].copy_from_slice(&STATUS_PLACEHOLDER.to_le_bytes());
+        assert!(!NoteHeader::parse(&with_items).unwrap().is_placeholder());
+
+        // Nor is an empty note without it.
+        assert!(!NoteHeader::parse(&synthetic_note(class::DOCUMENT, 0))
+            .unwrap()
+            .is_placeholder());
+    }
+
+    #[test]
+    fn placeholder_lists_its_responses_and_ignores_padding() {
+        let mut buf = synthetic_note(class::DOCUMENT, 0);
+        buf.truncate(NOTE_HEADER_BYTES);
+        buf[38..40].copy_from_slice(&STATUS_PLACEHOLDER.to_le_bytes());
+        buf[54..56].copy_from_slice(&2u16.to_le_bytes());
+        for id in [0x1002u32, 0x1006, 0] {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        let h = NoteHeader::parse(&buf).unwrap();
+        assert_eq!(h.placeholder_responses(&buf), vec![0x1002, 0x1006]);
+        // A record cut short yields nothing rather than a partial list.
+        assert!(h.placeholder_responses(&buf[..NOTE_HEADER_BYTES + 4]).is_empty());
     }
 
     #[test]
