@@ -54,6 +54,9 @@ pub struct Database<'a> {
     file_positions: std::sync::OnceLock<std::collections::HashMap<u32, u64>>,
     /// Item name ids of `$FILE`, built on first use from the BDB.
     file_name_ids: std::sync::OnceLock<Vec<u16>>,
+    /// Buckets whose per-sector stamp has been undone, by bucket byte
+    /// offset; `None` for a bucket read as it is. See [`Self::bucket_view`].
+    restored_buckets: std::sync::Mutex<std::collections::HashMap<u64, Option<&'a [u8]>>>,
 }
 
 /// Why an attachment's bytes could not be recovered.
@@ -97,7 +100,64 @@ impl<'a> Database<'a> {
             header,
             file_positions: Default::default(),
             file_name_ids: Default::default(),
+            restored_buckets: Default::default(),
         })
+    }
+
+    /// The bytes to read the bucket at `bucket_off` from: the file itself,
+    /// from the bucket to the end, or a patched copy of the bucket when it
+    /// carries per-sector stamps ([`crate::bucket::restore_sector_stamps`]).
+    ///
+    /// The patched copy is made once per bucket and kept for the life of the
+    /// process (leaked), which is what lets values borrowed from it carry
+    /// the same lifetime as values borrowed from the file. The cost is one
+    /// bucket-sized allocation per stamped bucket that is actually read.
+    fn bucket_view(&self, bucket_off: u64) -> Option<&'a [u8]> {
+        let raw = self.bytes.get(bucket_off as usize..)?;
+        let mut cache = self
+            .restored_buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let restored = *cache.entry(bucket_off).or_insert_with(|| {
+            crate::bucket::restore_sector_stamps(raw)
+                .map(|v| -> &'a [u8] { Box::leak(v.into_boxed_slice()) })
+        });
+        Some(restored.unwrap_or(raw))
+    }
+
+    /// Number of buckets read so far whose per-sector stamp was undone.
+    pub fn restored_bucket_count(&self) -> usize {
+        self.restored_buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|v| v.is_some())
+            .count()
+    }
+
+    /// Number of buckets read so far that parsed as buckets but did not
+    /// match the stamp layout and were read as they are.
+    pub fn unrestored_bucket_count(&self) -> usize {
+        self.restored_buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(off, v)| {
+                v.is_none()
+                    && self
+                        .bytes
+                        .get(**off as usize..)
+                        .is_some_and(|b| Bucket::parse(b).is_ok())
+            })
+            .count()
+    }
+
+    /// The note's record bytes as the item walk reads them: bounded to its
+    /// declared size, and taken from the restored copy of its bucket when
+    /// the bucket was stamped. `note.file_offset` is where these bytes sit
+    /// in the file either way.
+    pub fn note_record(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
+        self.record(note)
     }
 
     /// Name ids whose field name is `$FILE`.
@@ -430,12 +490,12 @@ impl<'a> Database<'a> {
         slot_index: u16,
     ) -> Result<&'a [u8], NsfError> {
         let offsets = self.summary_bucket_offsets()?;
-        Self::resolve_in(self.bytes, &offsets, bucket_index, slot_index)
+        self.resolve_in(&offsets, bucket_index, slot_index)
     }
 
     /// Resolve `bucket_index`/`slot_index` against a prebuilt descriptor map.
     fn resolve_in(
-        bytes: &'a [u8],
+        &self,
         offsets: &[u64],
         bucket_index: u32,
         slot_index: u16,
@@ -452,10 +512,9 @@ impl<'a> Database<'a> {
                 requested: bucket_index,
                 available: offsets.len(),
             })?;
-        let start = off as usize;
-        let bucket_bytes = bytes.get(start..).ok_or(NsfError::TooShort {
-            actual: bytes.len(),
-            required: start,
+        let bucket_bytes = self.bucket_view(off).ok_or(NsfError::TooShort {
+            actual: self.bytes.len(),
+            required: off as usize,
         })?;
         let bucket = Bucket::parse(bucket_bytes)?;
         bucket.slot(slot_index)
@@ -856,6 +915,7 @@ impl<'a> Database<'a> {
             Ok(header) if header.rrv_identifier == expected_identifier => Ok(ResolvedNote {
                 rrv_identifier: expected_identifier,
                 file_offset,
+                bucket_offset: None,
                 header,
             }),
             // Parsed as a note, but a different one. The characteristic
@@ -913,7 +973,7 @@ impl<'a> Database<'a> {
         let mut best_err = WithheldReason::Unresolvable;
         for &fp in &candidates {
             let bucket_off = u64::from(fp) << 8;
-            let Some(buf) = self.bytes.get(bucket_off as usize..) else {
+            let Some(buf) = self.bucket_view(bucket_off) else {
                 continue;
             };
             let Ok(bucket) = Bucket::parse(buf) else {
@@ -924,7 +984,10 @@ impl<'a> Database<'a> {
             };
             let slot_off = bucket_off + (slot.as_ptr() as usize - buf.as_ptr() as usize) as u64;
             match self.note_at(expected_id, slot_off, slot) {
-                Ok(note) => return Ok(note),
+                Ok(mut note) => {
+                    note.bucket_offset = Some(bucket_off);
+                    return Ok(note);
+                }
                 Err(e) => {
                     if e.rank() > best_err.rank() {
                         best_err = e;
@@ -992,6 +1055,16 @@ impl<'a> Database<'a> {
 
     /// The note's record bytes, bounded to its declared size.
     fn record(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
+        if let Some(bucket_off) = note.bucket_offset {
+            // Same bytes the header was parsed from: the bucket's restored
+            // copy when it was stamped, the file otherwise.
+            let view = self.bucket_view(bucket_off)?;
+            let start = note.file_offset.checked_sub(bucket_off)? as usize;
+            let end = start
+                .saturating_add(note.header.size as usize)
+                .min(view.len());
+            return view.get(start..end);
+        }
         let start = note.file_offset as usize;
         let end = start
             .saturating_add(note.header.size as usize)
@@ -1213,6 +1286,9 @@ pub struct ResolvedNote {
     pub rrv_identifier: u32,
     /// Byte offset of the note record within the file.
     pub file_offset: u64,
+    /// Byte offset of the bucket the note was resolved in, for a bucket-slot
+    /// note; `None` for one reached by file position.
+    pub bucket_offset: Option<u64>,
     /// The parsed note header.
     pub header: NoteHeader,
 }
