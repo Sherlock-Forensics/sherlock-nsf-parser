@@ -19,8 +19,10 @@
 //! 0x0F        control                 next byte minus 0x20 is a C0 control,
 //!                                     or a C1 control as it stands
 //! 0x10..0x13  Far East groups         next TWO bytes in a double-byte code
-//!                                     page (932, 949, 950, 936)
-//! 0x14        Unicode                 next two bytes are UTF-16BE
+//!                                     page (932, 949, 950, 936); a doubled
+//!                                     group byte, then one single byte
+//! 0x14        Unicode                 next two bytes are UTF-16BE; a
+//!                                     surrogate pair is two such sequences
 //! ```
 //!
 //! When the byte after a single-byte group byte is below 0x80 it is not
@@ -29,13 +31,19 @@
 //! double quotation marks, `01 07` a bullet, `02 73` a less-than-or-equal
 //! sign. Only groups 1, 2 and 6 have exceptions.
 //!
-//! This follows the ICU LMBCS converter (`ucnv_lmb.cpp`) and its mapping
-//! data; the tables are in [`crate::lmbcs_tables`]. What is not decoded:
-//! the four Far East groups, whose double-byte tables are too large to
-//! carry here. Their characters are consumed at their width and yield
-//! U+FFFD each, so the text around them stays aligned and the loss is
-//! visible rather than silent. The same goes for a byte a code page does
-//! not define and for a group byte that names no group.
+//! The group layout follows the ICU LMBCS converter (`ucnv_lmb.cpp`). The
+//! single-byte tables are in [`crate::lmbcs_tables`] and were checked
+//! against ICU's mapping data; the double-byte ones are in `lmbcs_dbcs.bin`
+//! (the comment on that table says where they come from and how far they
+//! are checked).
+//! Notes uses the Far East groups for
+//! more than Far East text: a symbol no single-byte group has, such as the
+//! subscript two in a chemical formula (`11 A9 FC`), comes as a Korean or
+//! Japanese code-page character in otherwise Western text.
+//!
+//! A byte a code page does not define, and a group byte that names no
+//! group, yield U+FFFD, consumed at their width so the text around them
+//! stays aligned and the loss is visible rather than silent.
 //!
 //! A NUL inside text is how Notes separates lines; it is passed through as
 //! U+0000 for the caller to treat as it needs.
@@ -79,6 +87,55 @@ fn exceptions(group: u8) -> Option<&'static [u16; 128]> {
     })
 }
 
+/// One UTF-16 code unit of the Unicode group, from its two bytes.
+fn utf16_unit(pair: &[u8]) -> u16 {
+    if pair[0] == 0xF6 {
+        u16::from(pair[1]) << 8
+    } else {
+        u16::from_be_bytes([pair[0], pair[1]])
+    }
+}
+
+/// The double-byte table of groups 0x10..=0x13: for each group in turn,
+/// lead bytes 0x81..=0xFE, each with trail bytes 0x40..=0xFE, one u16
+/// little-endian per pair, 0 where the code page has no character.
+///
+/// Data, generated from Python's codecs for the code pages these groups
+/// stand for (`cp932`, `cp949`, `cp950`, `gbk`): each pair decoded on its
+/// own, kept when it gives one BMP character other than U+FFFD. Real Notes
+/// text has confirmed the Japanese (0x10) and Korean (0x11) groups only;
+/// the two Chinese groups follow the same code-page assignment but are
+/// unchecked against Notes, and a Notes-specific variant of any of these
+/// pages (user-defined areas in particular) would differ. 192,528 bytes,
+/// SHA-256 c7bd2d5f8457feaa524be7e60d9894bf8d519e226d3028ac327bbaccd8b755b5.
+static DBCS: &[u8] = include_bytes!("lmbcs_dbcs.bin");
+const DBCS_LEADS: usize = 0xFE - 0x81 + 1;
+const DBCS_TRAILS: usize = 0xFE - 0x40 + 1;
+
+/// A double-byte character of a Far East group.
+fn dbcs(group: u8, lead: u8, trail: u8) -> char {
+    if !(0x81..=0xFE).contains(&lead) || !(0x40..=0xFE).contains(&trail) {
+        return REPLACEMENT;
+    }
+    let index = (usize::from(group - 0x10) * DBCS_LEADS + usize::from(lead - 0x81)) * DBCS_TRAILS
+        + usize::from(trail - 0x40);
+    DBCS.get(index * 2..index * 2 + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .filter(|&u| u != 0)
+        .and_then(|u| char::from_u32(u32::from(u)))
+        .unwrap_or(REPLACEMENT)
+}
+
+/// A single byte of a Far East group's code page: ASCII, or in code page
+/// 932 a half-width katakana (0xA1..=0xDF, U+FF61 onwards).
+fn dbcs_single(group: u8, byte: u8) -> char {
+    match (group, byte) {
+        (_, 0x00..=0x7F) => byte as char,
+        (0x10, 0xA1..=0xDF) => char::from_u32(0xFF61 + u32::from(byte - 0xA1)).unwrap_or(REPLACEMENT),
+        _ => REPLACEMENT,
+    }
+}
+
 /// Decode LMBCS bytes to a `String`.
 ///
 /// Never fails: a sequence cut short at the end of the input, a character
@@ -119,25 +176,37 @@ pub fn decode(bytes: &[u8]) -> String {
                     out.push(REPLACEMENT);
                     break;
                 };
-                let unit = if pair[0] == 0xF6 {
-                    u16::from(pair[1]) << 8
-                } else {
-                    u16::from_be_bytes([pair[0], pair[1]])
-                };
-                out.push(char::from_u32(u32::from(unit)).unwrap_or(REPLACEMENT));
+                let unit = utf16_unit(pair);
                 i += 3;
+                // A character beyond the BMP is a surrogate pair: two
+                // Unicode-group sequences in a row.
+                if (0xD800..0xDC00).contains(&unit) {
+                    if let Some(low) = bytes
+                        .get(i..i + 3)
+                        .filter(|s| s[0] == 0x14)
+                        .map(|s| utf16_unit(&s[1..]))
+                        .filter(|u| (0xDC00..0xE000).contains(u))
+                    {
+                        let c = 0x10000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                        out.push(char::from_u32(c).unwrap_or(REPLACEMENT));
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(char::from_u32(u32::from(unit)).unwrap_or(REPLACEMENT));
             }
-            // Far East groups: two bytes follow, or, when the group byte is
-            // doubled, one. No tables here.
+            // Far East groups: two bytes follow, a lead and a trail byte of
+            // the group's double-byte code page, or, when the group byte is
+            // doubled, one single byte of it.
             0x10..=0x13 => {
                 let Some(pair) = bytes.get(i + 1..i + 3) else {
                     out.push(REPLACEMENT);
                     break;
                 };
-                out.push(if pair[0] == b && pair[1] < 0x80 {
-                    pair[1] as char
+                out.push(if pair[0] == b {
+                    dbcs_single(b, pair[1])
                 } else {
-                    REPLACEMENT
+                    dbcs(b, pair[0], pair[1])
                 });
                 i += 3;
             }
@@ -221,6 +290,9 @@ mod tests {
         assert_eq!(decode(&[0x14, 0xF6, 0x21]), "\u{2100}");
         // A lone surrogate is not a character.
         assert_eq!(decode(&[0x14, 0xD8, 0x00]), "\u{fffd}");
+        assert_eq!(decode(&[0x14, 0xD8, 0x3D, b'x']), "\u{fffd}x");
+        // A pair is one character beyond the BMP.
+        assert_eq!(decode(&[0x14, 0xD8, 0x3D, 0x14, 0xDE, 0x00, b'!']), "\u{1f600}!");
     }
 
     #[test]
@@ -230,10 +302,32 @@ mod tests {
     }
 
     #[test]
-    fn far_east_characters_keep_the_text_around_them_aligned() {
-        assert_eq!(decode(&[b'x', 0x10, 0x88, 0x9F, b'y', 0x11, 0xA9, 0xFC, b'z']), "x\u{fffd}y\u{fffd}z");
-        // A doubled group byte announces a single byte.
+    fn each_far_east_group_uses_its_double_byte_code_page() {
+        // Japanese (932), Korean (949), Traditional (950) and Simplified
+        // (936) Chinese, each with text around it.
+        assert_eq!(decode(&[b'x', 0x10, 0x93, 0xFA, b'y']), "x\u{65e5}y"); // 日
+        assert_eq!(decode(&[0x11, 0xB0, 0xA1]), "\u{ac00}"); // 가
+        assert_eq!(decode(&[0x12, 0xA4, 0xA4]), "\u{4e2d}"); // 中
+        assert_eq!(decode(&[0x13, 0xD6, 0xD0]), "\u{4e2d}"); // 中
+        // Symbols Notes files under a Far East group in Western text.
+        assert_eq!(decode(b"CO\x11\xA9\xFC"), "CO\u{2082}"); // subscript two
+        assert_eq!(decode(&[0x10, 0x81, 0x9A]), "\u{2605}"); // black star
+    }
+
+    #[test]
+    fn far_east_holes_keep_the_text_around_them_aligned() {
+        // No character at 932 0x85 0x40, a trail byte out of range.
+        assert_eq!(decode(&[b'x', 0x10, 0x85, 0x40, b'y', 0x11, 0xB0, 0x20, b'z']), "x\u{fffd}y\u{fffd}z");
+        // A doubled group byte announces a single byte: ASCII, or a
+        // half-width katakana in 932.
         assert_eq!(decode(&[0x10, 0x10, b'A', b'z']), "Az");
+        assert_eq!(decode(&[0x10, 0x10, 0xB1]), "\u{ff71}");
+        assert_eq!(decode(&[0x11, 0x11, 0xB1]), "\u{fffd}");
+    }
+
+    #[test]
+    fn the_double_byte_table_has_its_shape() {
+        assert_eq!(DBCS.len(), 4 * DBCS_LEADS * DBCS_TRAILS * 2);
     }
 
     #[test]
