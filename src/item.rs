@@ -552,7 +552,7 @@ impl NoteItem<'_> {
             size: u32_at(16)?,
             created: Timedate::from_bytes(v.get(20..28)?).ok(),
             modified: Timedate::from_bytes(v.get(28..36)?).ok(),
-            name: String::from_utf8_lossy(name).into_owned(),
+            name: crate::lmbcs::decode(name),
             encrypted: self.type_flags & ITEM_SEAL != 0,
         })
     }
@@ -590,7 +590,7 @@ pub struct FileObject {
     pub created: Option<Timedate>,
     /// File modification time as recorded at attach time.
     pub modified: Option<Timedate>,
-    /// File name as attached.
+    /// File name as attached, decoded from LMBCS.
     pub name: String,
     /// The item is sealed ([`ITEM_SEAL`]): the object holds the file
     /// encrypted to the recipients' Notes IDs, and the descriptor alone is
@@ -1087,13 +1087,27 @@ mod typed_value_tests {
     }
 
     fn file_value(name: &str) -> Vec<u8> {
+        file_value_bytes(name.as_bytes())
+    }
+
+    fn file_value_bytes(name: &[u8]) -> Vec<u8> {
         let mut v = vec![0u8; 36];
         v[2..6].copy_from_slice(&52654u32.to_le_bytes());
         v[6..8].copy_from_slice(&(name.len() as u16).to_le_bytes());
         v[10..12].copy_from_slice(&1u16.to_le_bytes());
         v[16..20].copy_from_slice(&5131u32.to_le_bytes());
-        v.extend_from_slice(name.as_bytes());
+        v.extend_from_slice(name);
         v
+    }
+
+    /// The name is LMBCS like every other Notes text: a Latin-2 letter is
+    /// group 6 and a bare high byte is code page 850. Read as UTF-8 each of
+    /// them became U+FFFD.
+    #[test]
+    fn a_file_name_is_decoded_from_lmbcs() {
+        let v = file_value_bytes(b"Poro\x06\x9Filo za \x84o.pdf");
+        let fo = item(ITEM_NO_TYPE_WORD, &v).as_file_object().expect("descriptor");
+        assert_eq!(fo.name, "Poro\u{10d}ilo za \u{e4}o.pdf");
     }
 
     /// A sealed `$FILE` keeps its descriptor readable; only the object is

@@ -257,7 +257,8 @@ fn hotspot_file_name(body: &[u8]) -> Option<String> {
     let data = body.get(8..)?;
     let data = &data[..len.min(data.len())];
     let unique = data.split(|&b| b == 0).next()?;
-    (!unique.is_empty()).then(|| String::from_utf8_lossy(unique).into_owned())
+    // LMBCS, as the `$FILE` name it must match is.
+    (!unique.is_empty()).then(|| crate::lmbcs::decode(unique))
 }
 
 /// Parse a non-summary object into its rich-text body + attachments.
@@ -548,6 +549,15 @@ mod run_tests {
         assert_eq!(a.name, "ATT12345.xls");
         assert!(a.data.is_empty(), "the icon carries no bytes");
         assert_eq!(a.kind, AttachmentKind::File);
+    }
+
+    /// The icon's name is LMBCS like the `$FILE` name it is matched with.
+    #[test]
+    fn a_file_hotspot_name_is_decoded_from_lmbcs() {
+        let mut obj = vec![0u8; CD_STREAM_START];
+        obj.extend(hotspot(HOTSPOT_TYPE_FILE, b"Ra\x06\xE7un.pdf\0"));
+        let content = parse(&obj);
+        assert_eq!(content.attachments[0].name, "Ra\u{161}un.pdf");
     }
 
     /// A customer's Notes 4 mail file reported 8,450 attachments with no
