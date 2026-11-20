@@ -721,6 +721,23 @@ pub fn non_summary_total(record: &[u8], number_of_note_items: u16, header_len: u
     )
 }
 
+/// Offset in the record just past the last summary value: the header, the
+/// descriptor table, and every summary item's declared size. `None` when
+/// the table does not fit.
+pub fn summary_values_end(record: &[u8], number_of_note_items: u16, header_len: usize) -> Option<usize> {
+    let count = number_of_note_items as usize;
+    let table_end = header_len + count * ITEM_DESCRIPTOR_BYTES;
+    record.get(..table_end)?;
+    Some(
+        table_end
+            + (0..count)
+                .map(|i| header_len + i * ITEM_DESCRIPTOR_BYTES)
+                .filter(|&d| u16::from_le_bytes([record[d + 2], record[d + 3]]) & ITEM_SUMMARY != 0)
+                .map(|d| u16::from_le_bytes([record[d + 4], record[d + 5]]) as usize)
+                .sum::<usize>(),
+    )
+}
+
 /// The general walk: an item table starting at `header_len`, and optionally
 /// the note's non-summary data as bare item values.
 ///
@@ -728,7 +745,9 @@ pub fn non_summary_total(record: &[u8], number_of_note_items: u16, header_len: u
 /// values in descriptor order - the caller checks that the sizes add up
 /// (see [`non_summary_total`]) - and those items then get their values from
 /// it instead of being reported as stored elsewhere. That is the pre-Notes 5
-/// layout; a modern non-summary object has a header and is not passed here.
+/// layout, and the modern one once the object's header is taken off or the
+/// values are found inside the record (see
+/// [`crate::Database::non_summary_values`]).
 pub fn walk_items_at<'a>(
     record: &'a [u8],
     number_of_note_items: u16,

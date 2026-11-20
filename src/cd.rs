@@ -271,11 +271,19 @@ pub fn parse(obj: &[u8]) -> NoteContent {
 /// word, then CD records; each is walked on its own so one item's padding
 /// cannot shift the next item's records.
 pub fn parse_items(values: &[&[u8]]) -> NoteContent {
+    let streams: Vec<&[u8]> = values.iter().filter_map(|v| v.get(2..)).collect();
+    parse_values(&streams)
+}
+
+/// Parse rich-text values that are bare CD records, with no type word and
+/// no object header: the non-summary items of a modern note once located
+/// (see [`crate::Database::non_summary_values`]). Each value is walked on
+/// its own and the records are then read as one sequence, since a body or
+/// an image may continue across several items of the same name.
+pub fn parse_values(values: &[&[u8]]) -> NoteContent {
     let mut recs = Vec::new();
     for v in values {
-        if let Some(stream) = v.get(2..) {
-            recs.extend(walk_from(stream, 0));
-        }
+        recs.extend(walk_from(v, 0));
     }
     parse_records(recs)
 }

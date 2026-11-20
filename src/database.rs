@@ -1170,7 +1170,22 @@ impl<'a> Database<'a> {
                 .map(|it| it.value)
                 .collect();
             crate::cd::parse_items(&values)
+        } else if self.non_summary_values(note).is_some() {
+            // The values are located item by item, so each is walked on its
+            // own: a value that is not CD records (or an odd-length one)
+            // cannot shift the records of the next. A value that names a
+            // type other than rich text is not walked at all.
+            let items = self.note_items_walk(note).items;
+            let values: Vec<&[u8]> = items
+                .iter()
+                .filter(|it| it.type_flags & crate::item::ITEM_SUMMARY == 0)
+                .filter(|it| it.type_word().map_or(true, |w| w == 0x0001))
+                .map(|it| it.data())
+                .collect();
+            crate::cd::parse_values(&values)
         } else {
+            // Sizes that do not add up: fall back to walking the object as
+            // one stream, which is what was done before.
             self.non_summary_data(note)
                 .map(crate::cd::parse)
                 .unwrap_or_default()
@@ -1279,7 +1294,66 @@ impl<'a> Database<'a> {
                 self.legacy_non_summary(note),
             );
         }
-        crate::item::walk_items(record, note.header.number_of_note_items)
+        crate::item::walk_items_at(
+            record,
+            note.header.number_of_note_items,
+            crate::note::NOTE_HEADER_BYTES,
+            self.non_summary_values(note),
+        )
+    }
+
+    /// The values of the note's non-summary items, bare and back to back in
+    /// descriptor order, or `None` when the note has none or they could not
+    /// be located with certainty.
+    ///
+    /// A modern database keeps them in one of two places:
+    ///
+    /// - **A separate object**, at `non_summary_data_identifier << 8`: a
+    ///   68-byte header carrying the owning note's identifier, then the
+    ///   values. Seen on a note with three rich-text items and one other,
+    ///   whose sizes (22336 + 23690 + 12504 + 40) plus 68 were exactly the
+    ///   object's 58638 bytes, each value a well-formed CD record run that
+    ///   ended on its own boundary.
+    /// - **Inside the note's own record**, when they are small: the
+    ///   identifier is then not a file position but an offset in the
+    ///   record, at or after the end of the summary values. Seen on a note
+    ///   whose two 102-byte non-summary items sat at record offset 2639,
+    ///   the exact end of its summary values, with `non_summary_data_size`
+    ///   204; on others a few spare bytes (4, 8, 12 ...) lie between the
+    ///   two. Such notes carry status flag 0x2000. Read as a file position
+    ///   the identifier pointed into an unrelated structure, and the note's
+    ///   rich text was not found at all.
+    ///
+    /// Either is returned only when the non-summary items' declared sizes
+    /// add up to the bytes found, so a misread location yields nothing
+    /// rather than another note's data. On a pre-Notes 5 database this is
+    /// [`Self::non_summary_data`], which already is the bare values.
+    pub fn non_summary_values(&self, note: &ResolvedNote) -> Option<&[u8]> {
+        if self.header.uses_byte_positions() {
+            return self.legacy_non_summary(note);
+        }
+        let size = note.header.non_summary_data_size as usize;
+        if size == 0 {
+            return None;
+        }
+        let record = self.record(note)?;
+        let items = note.header.number_of_note_items;
+        let header_len = crate::note::NOTE_HEADER_BYTES;
+        let declared = crate::item::non_summary_total(record, items, header_len)?;
+        // The object first: its header names the note, which no coincidence
+        // of offsets can fake.
+        if let Some(values) = self
+            .non_summary_data(note)
+            .and_then(|obj| obj.get(crate::cd::CD_STREAM_START..))
+        {
+            return (values.len() == declared).then_some(values);
+        }
+        let at = note.header.non_summary_data_identifier as usize;
+        let summary_end = crate::item::summary_values_end(record, items, header_len)?;
+        if declared != size || at < summary_end {
+            return None;
+        }
+        record.get(at..at.checked_add(size)?)
     }
 
     pub fn note_items(&self, note: &ResolvedNote) -> Vec<crate::item::NoteItem<'_>> {
@@ -1795,5 +1869,128 @@ mod legacy_tests {
         let w = db.note_items_walk(n);
         assert!(w.unreached.iter().any(|u| u.name_id == 0x7E));
         assert_eq!(w.items.iter().find(|i| i.name_id == 0x68).unwrap().as_text(), "Hi Ed");
+    }
+}
+
+#[cfg(test)]
+mod non_summary_tests {
+    use super::*;
+
+    const NOTE_AT: usize = 0x400;
+    const OBJECT_AT: usize = 0x800;
+    const RRV: u32 = 0x0A12;
+
+    /// One CDTEXT record: BSIG framing, a 4-byte FONTID, then the text.
+    fn cdtext(text: &[u8]) -> Vec<u8> {
+        let mut r = vec![0x85, (2 + 4 + text.len()) as u8, 0, 0, 0, 0];
+        r.extend_from_slice(text);
+        r
+    }
+
+    /// A modern (page-position) file holding one note: a non-summary
+    /// rich-text item declared first, then a summary text item "hello".
+    /// `identifier` and `size` go in the header as given; `inline` is put
+    /// in the record right after the summary values.
+    fn file_with_note(identifier: u32, size: u32, body_len: u16, inline: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 0x1000];
+        b[0] = 0x1A;
+        b[2..6].copy_from_slice(&1024u32.to_le_bytes());
+        b[6..10].copy_from_slice(&52u32.to_le_bytes()); // ODS
+        let n = NOTE_AT;
+        let record_len = 100 + 16 + 5 + inline.len();
+        b[n] = 0x04;
+        b[n + 2..n + 6].copy_from_slice(&(record_len as u32).to_le_bytes());
+        b[n + 6..n + 10].copy_from_slice(&RRV.to_le_bytes());
+        b[n + 40..n + 42].copy_from_slice(&1u16.to_le_bytes());
+        b[n + 50..n + 52].copy_from_slice(&2u16.to_le_bytes());
+        b[n + 56..n + 60].copy_from_slice(&identifier.to_le_bytes());
+        b[n + 60..n + 64].copy_from_slice(&size.to_le_bytes());
+        let d = n + 100;
+        // Body: no summary bit, bare data (no type word).
+        b[d..d + 2].copy_from_slice(&0x7Eu16.to_le_bytes());
+        b[d + 2..d + 4].copy_from_slice(&0x0008u16.to_le_bytes());
+        b[d + 4..d + 6].copy_from_slice(&body_len.to_le_bytes());
+        // Subject: summary, bare data.
+        b[d + 8..d + 10].copy_from_slice(&0x68u16.to_le_bytes());
+        b[d + 10..d + 12].copy_from_slice(&0x000Cu16.to_le_bytes());
+        b[d + 12..d + 14].copy_from_slice(&5u16.to_le_bytes());
+        b[d + 16..d + 21].copy_from_slice(b"hello");
+        b[d + 21..d + 21 + inline.len()].copy_from_slice(inline);
+        b
+    }
+
+    fn note(db: &Database<'_>, bytes: &[u8]) -> ResolvedNote {
+        db.note_at(RRV, NOTE_AT as u64, &bytes[NOTE_AT..]).expect("note")
+    }
+
+    /// Small non-summary data lives in the record itself, at the offset
+    /// the identifier gives: the end of the summary values.
+    #[test]
+    fn non_summary_values_inside_the_record_are_read() {
+        let body = cdtext(b"Body");
+        let b = file_with_note(100 + 16 + 5, body.len() as u32, body.len() as u16, &body);
+        let db = Database::open(&b).unwrap();
+        let n = note(&db, &b);
+        assert_eq!(db.non_summary_values(&n), Some(&body[..]));
+        let w = db.note_items_walk(&n);
+        assert!(w.unreached.is_empty());
+        assert_eq!(w.items.iter().find(|i| i.name_id == 0x7E).unwrap().value, &body[..]);
+        assert_eq!(w.items.iter().find(|i| i.name_id == 0x68).unwrap().as_text(), "hello");
+        assert_eq!(db.note_content(&n).unwrap().body_text, "Body");
+    }
+
+    /// Spare bytes may lie between the summary values and the data; the
+    /// identifier says where the data starts.
+    #[test]
+    fn non_summary_values_after_spare_bytes_are_read() {
+        let body = cdtext(b"Body");
+        let mut tail = vec![0xEE, 0xE0, 0x00, 0x00];
+        tail.extend_from_slice(&body);
+        let b = file_with_note(100 + 16 + 5 + 4, body.len() as u32, body.len() as u16, &tail);
+        let db = Database::open(&b).unwrap();
+        let n = note(&db, &b);
+        assert_eq!(db.non_summary_values(&n), Some(&body[..]));
+        assert_eq!(db.note_content(&n).unwrap().body_text, "Body");
+        // Past the end of the record it is not read.
+        let b = file_with_note(100 + 16 + 5 + 5, body.len() as u32, body.len() as u16, &tail);
+        let db = Database::open(&b).unwrap();
+        assert_eq!(db.non_summary_values(&note(&db, &b)), None);
+    }
+
+    /// Larger data lives in an object: a 68-byte header naming the note,
+    /// then the values.
+    #[test]
+    fn non_summary_values_in_an_object_are_read_past_its_header() {
+        let body = cdtext(b"Body");
+        let size = 68 + body.len();
+        let mut b = file_with_note((OBJECT_AT >> 8) as u32, size as u32, body.len() as u16, &[]);
+        b[OBJECT_AT] = 0x10;
+        b[OBJECT_AT + 2..OBJECT_AT + 6].copy_from_slice(&(size as u32).to_le_bytes());
+        b[OBJECT_AT + 6..OBJECT_AT + 10].copy_from_slice(&RRV.to_le_bytes());
+        b[OBJECT_AT + 68..OBJECT_AT + size].copy_from_slice(&body);
+        let db = Database::open(&b).unwrap();
+        let n = note(&db, &b);
+        assert_eq!(db.non_summary_values(&n), Some(&body[..]));
+        assert!(db.note_items_walk(&n).unreached.is_empty());
+        assert_eq!(db.note_content(&n).unwrap().body_text, "Body");
+    }
+
+    /// Neither place is trusted unless the sizes add up, or the offset is
+    /// exactly where the summary values end.
+    #[test]
+    fn non_summary_values_that_do_not_add_up_are_not_read() {
+        let body = cdtext(b"Body");
+        // Header size one more than the item declares.
+        let b = file_with_note(100 + 16 + 5, body.len() as u32 + 1, body.len() as u16, &body);
+        let db = Database::open(&b).unwrap();
+        let n = note(&db, &b);
+        assert_eq!(db.non_summary_values(&n), None);
+        assert_eq!(db.note_items_walk(&n).unreached.len(), 1);
+        // Offset two bytes into the summary values.
+        let b = file_with_note(100 + 16 + 3, body.len() as u32, body.len() as u16, &body);
+        let db = Database::open(&b).unwrap();
+        let n = note(&db, &b);
+        assert_eq!(db.non_summary_values(&n), None);
+        assert!(db.note_content(&n).is_none());
     }
 }
