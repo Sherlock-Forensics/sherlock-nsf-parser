@@ -257,7 +257,7 @@ impl<'a> NoteItem<'a> {
         let mut off = header;
         for l in lens {
             let end = off + l;
-            out.push(String::from_utf8_lossy(&v[off..end]).into_owned());
+            out.push(crate::lmbcs::decode(&v[off..end]));
             off = end;
         }
         Some(out)
@@ -1986,6 +1986,14 @@ mod text_list_tests {
     fn single_entry_list_decodes() {
         let v = encode(&["CN=Alice/O=Acme"]);
         assert_eq!(item(&v).as_text_list().unwrap(), vec!["CN=Alice/O=Acme"]);
+    }
+
+    /// Entries are LMBCS, like any Notes text.
+    #[test]
+    fn entries_are_decoded_from_lmbcs() {
+        let mut v = vec![2, 0, 5, 0, 2, 0];
+        v.extend_from_slice(b"\x06\xE7ola\x81b");
+        assert_eq!(item(&v).as_text_list().unwrap(), vec!["\u{161}ola", "\u{fc}b"]);
     }
 
     #[test]
