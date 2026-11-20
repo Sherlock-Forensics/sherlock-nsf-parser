@@ -63,6 +63,9 @@ pub struct Database<'a> {
     /// `None` once its bucket was looked at and is read as it is. See
     /// [`Self::bucket_view`].
     restored_buckets: std::sync::OnceLock<Vec<[RestoredCell; BUCKET_CANDIDATES]>>,
+    /// Total bytes held in `restored_buckets`, kept at or below the size of
+    /// the file. See [`Self::bucket_view`].
+    restored_bytes: std::sync::atomic::AtomicUsize,
 }
 
 /// Candidate file positions tried for one summary bucket: the descriptor as
@@ -115,6 +118,7 @@ impl<'a> Database<'a> {
             file_name_ids: Default::default(),
             summary_fps: Default::default(),
             restored_buckets: Default::default(),
+            restored_bytes: Default::default(),
         })
     }
 
@@ -157,7 +161,17 @@ impl<'a> Database<'a> {
     /// return values tied to `&self`. The cost is one bucket-sized
     /// allocation (at most [`crate::bucket::MAX_STAMPED_BUCKET_BYTES`]) per
     /// stamped bucket actually read, freed with the `Database`.
+    ///
+    /// The descriptors come from the file, so the copies are bounded
+    /// whatever they say. In a real database the buckets are disjoint
+    /// regions of the file and their copies cannot add up to more than the
+    /// file; a crafted one could point many descriptors at one stamped
+    /// bucket and have it copied once per descriptor. So the total held is
+    /// kept at or below the file's size, and a bucket that would exceed it
+    /// is read as it is. Likewise no more cells are kept than the file
+    /// could hold buckets at the smallest position unit (256 bytes).
     fn bucket_view(&self, ord: usize, cand: usize) -> Option<(u64, &[u8])> {
+        use std::sync::atomic::Ordering;
         let fps = self.cached_summary_fps();
         let candidates = Self::bucket_candidates(fps, ord)?;
         let fp = *candidates.get(cand)?;
@@ -165,11 +179,23 @@ impl<'a> Database<'a> {
         let cand = candidates.iter().position(|&c| c == fp).unwrap_or(cand);
         let bucket_off = u64::from(fp) << 8;
         let raw: &'a [u8] = self.bytes.get(bucket_off as usize..)?;
-        let cells = self
-            .restored_buckets
-            .get_or_init(|| (0..fps.len()).map(|_| Default::default()).collect());
-        let restored = cells.get(ord)?[cand].get_or_init(|| {
-            crate::bucket::restore_sector_stamps(raw).map(Vec::into_boxed_slice)
+        let budget = self.bytes.len();
+        let cells = self.restored_buckets.get_or_init(|| {
+            (0..fps.len().min(budget / 256 + 1))
+                .map(|_| Default::default())
+                .collect()
+        });
+        let Some(row) = cells.get(ord) else {
+            return Some((bucket_off, raw));
+        };
+        let restored = row[cand].get_or_init(|| {
+            let copy = crate::bucket::restore_sector_stamps(raw)?;
+            let held = self.restored_bytes.fetch_add(copy.len(), Ordering::Relaxed);
+            if held.saturating_add(copy.len()) > budget {
+                self.restored_bytes.fetch_sub(copy.len(), Ordering::Relaxed);
+                return None;
+            }
+            Some(copy.into_boxed_slice())
         });
         Some((bucket_off, restored.as_deref().unwrap_or(raw)))
     }
