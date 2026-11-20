@@ -942,14 +942,17 @@ impl<'a> Database<'a> {
         };
         if let Some(expected) = obj.sha1 {
             use sha1::Digest;
-            // The digest is of the bytes as stored. For an uncompressed
-            // file those are the file; for LZ1 they are the compressed
-            // payload (seen on a file held both ways: the two objects
-            // record different digests, each the SHA-1 of its own
-            // payload). The LZ1 decode is held to the declared size and to
-            // every chunk's own length, and the stored bytes it was made
-            // from are what the digest vouches for.
-            let hashed: &[u8] = if file.compression == 2 { obj.payload } else { &data };
+            // The digest is of the bytes as stored, whatever the
+            // compression. For an uncompressed file those are the file. For
+            // LZ1 and Huffman they are the compressed payload: a file held
+            // both stored and LZ1-compressed has two objects with different
+            // digests, each the SHA-1 of its own payload, and the same held
+            // for five Huffman objects. Hashing the decoded file instead
+            // reported every valid compressed attachment in a 0x001B object
+            // as a mismatch. What vouches for the decode itself is each
+            // decoder's own check: the declared size, and the byte-sum
+            // checksum (Huffman) or every chunk's length (LZ1).
+            let hashed: &[u8] = if file.compression == 0 { &data } else { obj.payload };
             let got: String = sha1::Sha1::digest(hashed)
                 .iter()
                 .map(|b| format!("{b:02X}"))
