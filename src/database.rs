@@ -84,8 +84,9 @@ pub enum AttachmentError {
     Truncated,
     /// The Huffman payload did not decode to the declared file.
     Huffman(crate::huff::HuffError),
-    /// LZ1 (2) or another scheme this build does not decode. LZ1 arrived in
-    /// Notes 6, so a Notes 4 database has none.
+    /// The LZ1 payload did not decode to the declared file.
+    Lz1(crate::lz1::Lz1Error),
+    /// A compression type other than none (0), Huffman (1) and LZ1 (2).
     UnsupportedCompression(u16),
     /// The object records the file's SHA-1 and the recovered bytes do not
     /// match it.
@@ -936,11 +937,20 @@ impl<'a> Database<'a> {
                 .map(<[u8]>::to_vec)
                 .ok_or(AttachmentError::Truncated)?,
             1 => crate::huff::decompress(obj.payload, size).map_err(AttachmentError::Huffman)?,
+            2 => crate::lz1::decompress(obj.payload, size).map_err(AttachmentError::Lz1)?,
             other => return Err(AttachmentError::UnsupportedCompression(other)),
         };
         if let Some(expected) = obj.sha1 {
             use sha1::Digest;
-            let got: String = sha1::Sha1::digest(&data)
+            // The digest is of the bytes as stored. For an uncompressed
+            // file those are the file; for LZ1 they are the compressed
+            // payload (seen on a file held both ways: the two objects
+            // record different digests, each the SHA-1 of its own
+            // payload). The LZ1 decode is held to the declared size and to
+            // every chunk's own length, and the stored bytes it was made
+            // from are what the digest vouches for.
+            let hashed: &[u8] = if file.compression == 2 { obj.payload } else { &data };
+            let got: String = sha1::Sha1::digest(hashed)
                 .iter()
                 .map(|b| format!("{b:02X}"))
                 .collect();
