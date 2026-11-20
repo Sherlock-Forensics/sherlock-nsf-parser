@@ -291,8 +291,8 @@ pub fn parse_values(values: &[&[u8]]) -> NoteContent {
 fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
     let mut content = NoteContent::default();
 
-    // Body text: concatenate CDTEXT runs (4-byte FONTID prefix, then LMBCS;
-    // we emit printable ASCII and treat NUL as a run separator). The FONTID
+    // Body text: concatenate CDTEXT runs (4-byte FONTID prefix, then LMBCS,
+    // decoded to Unicode, a NUL being a line break). The FONTID
     // prefix the flattened text skips carries the emphasis, so the same pass
     // records the runs it was flattened from.
     let mut pending_break = false;
@@ -304,13 +304,19 @@ fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
         // FONTIDFIELDS: Face, Attrib, Color, PointSize.
         let style = RunStyle::from_attrib(r.body.get(1).copied().unwrap_or(0));
         let text = r.body.get(4..).unwrap_or(&[]);
-        let mut run = String::new();
-        for &b in text {
-            match b {
-                0x09 | 0x0A | 0x0D | 0x20..=0x7E => run.push(b as char),
-                _ => {}
-            }
-        }
+        // The text is LMBCS, as item values are. Dropping every byte that
+        // is not printable ASCII, as this once did, silently removed each
+        // accented letter: a word came out shorter, and still looked like
+        // a word. A NUL is Notes' line break inside a run.
+        let run: String = crate::lmbcs::decode(text)
+            .chars()
+            .filter_map(|c| match c {
+                '\0' => Some('\n'),
+                '\t' | '\n' | '\r' => Some(c),
+                c if c.is_control() => None,
+                c => Some(c),
+            })
+            .collect();
         content.body_text.push_str(&run);
         content.body_text.push('\n');
         if !run.is_empty() {
@@ -393,6 +399,18 @@ fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CDTEXT run keeps its accented letters: bare high bytes are code
+    /// page 850, group 6 is code page 852, and a NUL breaks the line.
+    #[test]
+    fn body_text_is_decoded_from_lmbcs() {
+        let text: &[u8] = b"f\x81r me\x06\xE7al\x00x";
+        let mut rec = vec![SIG_TEXT, (2 + 4 + text.len()) as u8, 0, 0, 0, 0];
+        rec.extend_from_slice(text);
+        let content = parse_values(&[&rec]);
+        assert_eq!(content.body_text, "f\u{fc}r me\u{161}al\nx");
+        assert_eq!(content.runs[0].text, "f\u{fc}r me\u{161}al\nx");
+    }
 
     #[test]
     fn walk_empty_object_is_safe() {

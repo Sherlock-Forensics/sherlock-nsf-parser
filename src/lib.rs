@@ -68,6 +68,7 @@ pub mod header;
 pub mod huff;
 pub mod info2;
 pub mod item;
+pub mod lmbcs;
 pub mod note;
 pub mod ods;
 pub mod rrv;
