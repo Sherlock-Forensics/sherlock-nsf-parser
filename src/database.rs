@@ -54,10 +54,23 @@ pub struct Database<'a> {
     file_positions: std::sync::OnceLock<std::collections::HashMap<u32, u64>>,
     /// Item name ids of `$FILE`, built on first use from the BDB.
     file_name_ids: std::sync::OnceLock<Vec<u16>>,
-    /// Buckets whose per-sector stamp has been undone, by bucket byte
-    /// offset; `None` for a bucket read as it is. See [`Self::bucket_view`].
-    restored_buckets: std::sync::Mutex<std::collections::HashMap<u64, Option<&'a [u8]>>>,
+    /// Raw summary-bucket descriptors, built on first use. See
+    /// [`Self::summary_bucket_raw_fps`].
+    summary_fps: std::sync::OnceLock<Vec<u32>>,
+    /// Restored copies of stamped summary buckets, owned here and filled on
+    /// first read: one row per summary bucket, one cell per candidate file
+    /// position of that bucket ([`Self::bucket_candidates`]). A cell holds
+    /// `None` once its bucket was looked at and is read as it is. See
+    /// [`Self::bucket_view`].
+    restored_buckets: std::sync::OnceLock<Vec<[RestoredCell; BUCKET_CANDIDATES]>>,
 }
+
+/// Candidate file positions tried for one summary bucket: the descriptor as
+/// stored, then its group-marker-corrected forms.
+const BUCKET_CANDIDATES: usize = 4;
+
+/// One lazily restored bucket copy; `None` inside for a bucket read as it is.
+type RestoredCell = std::sync::OnceLock<Option<Box<[u8]>>>;
 
 /// Why an attachment's bytes could not be recovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,63 +113,83 @@ impl<'a> Database<'a> {
             header,
             file_positions: Default::default(),
             file_name_ids: Default::default(),
+            summary_fps: Default::default(),
             restored_buckets: Default::default(),
         })
     }
 
-    /// The bytes to read the bucket at `bucket_off` from: the file itself,
-    /// from the bucket to the end, or a patched copy of the bucket when it
-    /// carries per-sector stamps ([`crate::bucket::restore_sector_stamps`]).
+    /// The raw summary-bucket descriptors, read once. A database whose
+    /// descriptors cannot be read has none.
+    fn cached_summary_fps(&self) -> &[u32] {
+        self.summary_fps
+            .get_or_init(|| self.summary_bucket_raw_fps().unwrap_or_default())
+    }
+
+    /// The file positions (256-byte units) to try for summary bucket
+    /// `ord` (0-based): the descriptor as stored, then the forms that undo
+    /// a group marker in its low nibble or in bits 16-19 (where the true
+    /// nibble is that of a neighbouring descriptor, buckets being locally
+    /// sequential). See [`Self::enumerate_notes`].
+    fn bucket_candidates(fps: &[u32], ord: usize) -> Option<[u32; BUCKET_CANDIDATES]> {
+        let primary = *fps.get(ord)?;
+        let prev_hi = ord
+            .checked_sub(1)
+            .and_then(|i| fps.get(i))
+            .map(|f| f & 0x000F_0000)
+            .unwrap_or(0);
+        let next_hi = fps.get(ord + 1).map(|f| f & 0x000F_0000).unwrap_or(0);
+        Some([
+            primary,
+            primary & 0xFFFF_FFF0,
+            (primary & 0xFFF0_FFFF) | prev_hi,
+            (primary & 0xFFF0_FFFF) | next_hi,
+        ])
+    }
+
+    /// The bytes to read candidate `cand` of summary bucket `ord` from, and
+    /// the bucket's byte offset in the file: the file itself, from the
+    /// bucket to the end, or a restored copy of the bucket when it carries
+    /// per-sector stamps ([`crate::bucket::restore_sector_stamps`]).
     ///
-    /// The patched copy is made once per bucket and kept for the life of the
-    /// process (leaked), which is what lets values borrowed from it carry
-    /// the same lifetime as values borrowed from the file. The cost is one
-    /// bucket-sized allocation per stamped bucket that is actually read.
-    fn bucket_view(&self, bucket_off: u64) -> Option<&'a [u8]> {
-        let raw = self.bytes.get(bucket_off as usize..)?;
-        let mut cache = self
+    /// The restored copy is made once and owned by this `Database`, so what
+    /// is borrowed from it lives as long as the borrow of `self`, not as
+    /// long as the file bytes. That is why the record and item accessors
+    /// return values tied to `&self`. The cost is one bucket-sized
+    /// allocation (at most [`crate::bucket::MAX_STAMPED_BUCKET_BYTES`]) per
+    /// stamped bucket actually read, freed with the `Database`.
+    fn bucket_view(&self, ord: usize, cand: usize) -> Option<(u64, &[u8])> {
+        let fps = self.cached_summary_fps();
+        let candidates = Self::bucket_candidates(fps, ord)?;
+        let fp = *candidates.get(cand)?;
+        // Candidates often coincide; keep one copy for equal positions.
+        let cand = candidates.iter().position(|&c| c == fp).unwrap_or(cand);
+        let bucket_off = u64::from(fp) << 8;
+        let raw: &'a [u8] = self.bytes.get(bucket_off as usize..)?;
+        let cells = self
             .restored_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let restored = *cache.entry(bucket_off).or_insert_with(|| {
-            crate::bucket::restore_sector_stamps(raw)
-                .map(|v| -> &'a [u8] { Box::leak(v.into_boxed_slice()) })
+            .get_or_init(|| (0..fps.len()).map(|_| Default::default()).collect());
+        let restored = cells.get(ord)?[cand].get_or_init(|| {
+            crate::bucket::restore_sector_stamps(raw).map(Vec::into_boxed_slice)
         });
-        Some(restored.unwrap_or(raw))
+        Some((bucket_off, restored.as_deref().unwrap_or(raw)))
     }
 
     /// Number of buckets read so far whose per-sector stamp was undone.
     pub fn restored_bucket_count(&self) -> usize {
-        self.restored_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|v| v.is_some())
-            .count()
-    }
-
-    /// Number of buckets read so far that parsed as buckets but did not
-    /// match the stamp layout and were read as they are.
-    pub fn unrestored_bucket_count(&self) -> usize {
-        self.restored_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(off, v)| {
-                v.is_none()
-                    && self
-                        .bytes
-                        .get(**off as usize..)
-                        .is_some_and(|b| Bucket::parse(b).is_ok())
-            })
-            .count()
+        self.restored_buckets.get().map_or(0, |cells| {
+            cells
+                .iter()
+                .flatten()
+                .filter(|c| matches!(c.get(), Some(Some(_))))
+                .count()
+        })
     }
 
     /// The note's record bytes as the item walk reads them: bounded to its
     /// declared size, and taken from the restored copy of its bucket when
     /// the bucket was stamped. `note.file_offset` is where these bytes sit
     /// in the file either way.
-    pub fn note_record(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
+    pub fn note_record(&self, note: &ResolvedNote) -> Option<&[u8]> {
         self.record(note)
     }
 
@@ -488,31 +521,21 @@ impl<'a> Database<'a> {
         &self,
         bucket_index: u32,
         slot_index: u16,
-    ) -> Result<&'a [u8], NsfError> {
+    ) -> Result<&[u8], NsfError> {
+        // Read here, not from the cache, so a descriptor map that cannot be
+        // read is reported as the error it is.
         let offsets = self.summary_bucket_offsets()?;
-        self.resolve_in(&offsets, bucket_index, slot_index)
-    }
-
-    /// Resolve `bucket_index`/`slot_index` against a prebuilt descriptor map.
-    fn resolve_in(
-        &self,
-        offsets: &[u64],
-        bucket_index: u32,
-        slot_index: u16,
-    ) -> Result<&'a [u8], NsfError> {
-        let ordinal = (bucket_index as usize)
-            .checked_sub(1)
-            .ok_or(NsfError::BucketIndexOutOfRange {
-                requested: bucket_index,
-                available: offsets.len(),
-            })?;
-        let off = *offsets
-            .get(ordinal)
-            .ok_or(NsfError::BucketIndexOutOfRange {
-                requested: bucket_index,
-                available: offsets.len(),
-            })?;
-        let bucket_bytes = self.bucket_view(off).ok_or(NsfError::TooShort {
+        let out_of_range = NsfError::BucketIndexOutOfRange {
+            requested: bucket_index,
+            available: offsets.len(),
+        };
+        let Some(ordinal) = (bucket_index as usize).checked_sub(1) else {
+            return Err(out_of_range);
+        };
+        let Some(&off) = offsets.get(ordinal) else {
+            return Err(out_of_range);
+        };
+        let (_, bucket_bytes) = self.bucket_view(ordinal, 0).ok_or(NsfError::TooShort {
             actual: self.bytes.len(),
             required: off as usize,
         })?;
@@ -592,7 +615,12 @@ impl<'a> Database<'a> {
         let Some((rrv_bucket_size, rrv_offsets)) = self.modern_rrv_buckets()? else {
             return Ok(out);
         };
-        let raw_fps = self.summary_bucket_raw_fps()?;
+        // Read the descriptors here so a failure is reported, then keep them
+        // for every bucket lookup that follows.
+        if self.summary_fps.get().is_none() {
+            let fps = self.summary_bucket_raw_fps()?;
+            let _ = self.summary_fps.set(fps);
+        }
 
         for &bucket_off in &rrv_offsets {
             let start = bucket_off as usize;
@@ -623,7 +651,6 @@ impl<'a> Database<'a> {
                     } => {
                         out.bucket_slot_total += 1;
                         let r = self.resolve_validated(
-                            &raw_fps,
                             bucket_index,
                             slot_index,
                             entry.rrv_identifier,
@@ -915,6 +942,7 @@ impl<'a> Database<'a> {
             Ok(header) if header.rrv_identifier == expected_identifier => Ok(ResolvedNote {
                 rrv_identifier: expected_identifier,
                 file_offset,
+                bucket_index: None,
                 bucket_offset: None,
                 header,
             }),
@@ -939,7 +967,6 @@ impl<'a> Database<'a> {
     /// reports the most informative failure any candidate produced.
     fn resolve_validated(
         &self,
-        raw_fps: &[u32],
         bucket_index: u32,
         slot_index: u16,
         expected_id: u32,
@@ -947,33 +974,17 @@ impl<'a> Database<'a> {
         let Some(ord) = (bucket_index as usize).checked_sub(1) else {
             return Err(WithheldReason::Unresolvable);
         };
-        let Some(&primary) = raw_fps.get(ord) else {
+        if ord >= self.cached_summary_fps().len() {
             return Err(WithheldReason::Unresolvable);
-        };
-        // High nibble (bits 16-19) of neighbouring descriptors, used to
-        // repair a bits-16-19 group marker (buckets are locally sequential).
-        let prev_hi = ord
-            .checked_sub(1)
-            .and_then(|i| raw_fps.get(i))
-            .map(|f| f & 0x000F_0000)
-            .unwrap_or(0);
-        let next_hi = raw_fps.get(ord + 1).map(|f| f & 0x000F_0000).unwrap_or(0);
-
-        let candidates = [
-            primary,
-            primary & 0xFFFF_FFF0,                    // low-nibble group marker
-            (primary & 0xFFF0_FFFF) | prev_hi,        // bits-16-19 marker, prev high nibble
-            (primary & 0xFFF0_FFFF) | next_hi,        // bits-16-19 marker, next high nibble
-        ];
+        }
 
         // Best failure seen across the candidates. An IdentityMismatch says
         // the slot was located and holds a real but different note, which is
         // far more informative than "could not locate", so it outranks the
         // other reasons when several candidates fail differently.
         let mut best_err = WithheldReason::Unresolvable;
-        for &fp in &candidates {
-            let bucket_off = u64::from(fp) << 8;
-            let Some(buf) = self.bucket_view(bucket_off) else {
+        for cand in 0..BUCKET_CANDIDATES {
+            let Some((bucket_off, buf)) = self.bucket_view(ord, cand) else {
                 continue;
             };
             let Ok(bucket) = Bucket::parse(buf) else {
@@ -985,6 +996,7 @@ impl<'a> Database<'a> {
             let slot_off = bucket_off + (slot.as_ptr() as usize - buf.as_ptr() as usize) as u64;
             match self.note_at(expected_id, slot_off, slot) {
                 Ok(mut note) => {
+                    note.bucket_index = Some(bucket_index);
                     note.bucket_offset = Some(bucket_off);
                     return Ok(note);
                 }
@@ -1054,11 +1066,15 @@ impl<'a> Database<'a> {
     }
 
     /// The note's record bytes, bounded to its declared size.
-    fn record(&self, note: &ResolvedNote) -> Option<&'a [u8]> {
-        if let Some(bucket_off) = note.bucket_offset {
+    fn record(&self, note: &ResolvedNote) -> Option<&[u8]> {
+        if let (Some(bucket_index), Some(bucket_off)) = (note.bucket_index, note.bucket_offset) {
             // Same bytes the header was parsed from: the bucket's restored
             // copy when it was stamped, the file otherwise.
-            let view = self.bucket_view(bucket_off)?;
+            let ord = (bucket_index as usize).checked_sub(1)?;
+            let view = (0..BUCKET_CANDIDATES)
+                .filter_map(|cand| self.bucket_view(ord, cand))
+                .find(|(off, _)| *off == bucket_off)?
+                .1;
             let start = note.file_offset.checked_sub(bucket_off)? as usize;
             let end = start
                 .saturating_add(note.header.size as usize)
@@ -1214,7 +1230,7 @@ impl<'a> Database<'a> {
         (recs, skipped)
     }
 
-    pub fn note_items_walk(&self, note: &ResolvedNote) -> crate::item::ItemWalk<'a> {
+    pub fn note_items_walk(&self, note: &ResolvedNote) -> crate::item::ItemWalk<'_> {
         let Some(record) = self.record(note) else {
             return crate::item::ItemWalk {
                 items: Vec::new(),
@@ -1240,7 +1256,7 @@ impl<'a> Database<'a> {
         crate::item::walk_items(record, note.header.number_of_note_items)
     }
 
-    pub fn note_items(&self, note: &ResolvedNote) -> Vec<crate::item::NoteItem<'a>> {
+    pub fn note_items(&self, note: &ResolvedNote) -> Vec<crate::item::NoteItem<'_>> {
         self.note_items_walk(note).items
     }
 }
@@ -1286,8 +1302,11 @@ pub struct ResolvedNote {
     pub rrv_identifier: u32,
     /// Byte offset of the note record within the file.
     pub file_offset: u64,
-    /// Byte offset of the bucket the note was resolved in, for a bucket-slot
-    /// note; `None` for one reached by file position.
+    /// 1-based index of the summary bucket the note was resolved in, for a
+    /// bucket-slot note; `None` for one reached by file position.
+    pub bucket_index: Option<u32>,
+    /// Byte offset of that bucket in the file, which for a descriptor
+    /// carrying a group marker is not the offset the descriptor states.
     pub bucket_offset: Option<u64>,
     /// The parsed note header.
     pub header: NoteHeader,

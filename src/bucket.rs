@@ -92,6 +92,10 @@ impl BucketHeader {
 pub const STAMP_SECTOR_BYTES: usize = 512;
 /// Offset inside each sector of the byte whose low nibble carries the stamp.
 pub const STAMP_OFFSET_IN_SECTOR: usize = 66;
+/// Largest declared bucket size [`restore_sector_stamps`] will copy. The
+/// size comes from the file, so a crafted header must not be able to ask
+/// for an arbitrary allocation; real summary buckets seen are 32 KiB.
+pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
 
 /// Undo the per-sector stamp of a bucket, returning a patched copy.
 ///
@@ -107,7 +111,8 @@ pub const STAMP_OFFSET_IN_SECTOR: usize = 66;
 /// `bytes` starts at the bucket and may run past it. Returns `None`, leaving
 /// the bucket to be read as it is, unless all of this holds:
 ///
-/// - the header parses and the whole declared bucket is present;
+/// - the header parses, the declared size is at most
+///   [`MAX_STAMPED_BUCKET_BYTES`], and the whole bucket is present;
 /// - the size is a whole number of sectors and the footer holds exactly one
 ///   nibble per sector (`footer_size * 2 == size / 512`);
 /// - every sector's byte at offset 66 carries the same low nibble (the
@@ -117,6 +122,11 @@ pub const STAMP_OFFSET_IN_SECTOR: usize = 66;
 pub fn restore_sector_stamps(bytes: &[u8]) -> Option<Vec<u8>> {
     let header = BucketHeader::parse(bytes).ok()?;
     let size = header.size as usize;
+    // The size is whatever the file says. Refuse to copy more than a
+    // bucket can plausibly be before looking at anything else.
+    if size > MAX_STAMPED_BUCKET_BYTES {
+        return None;
+    }
     let bucket = bytes.get(..size)?;
     if size == 0 || size % STAMP_SECTOR_BYTES != 0 {
         return None;
@@ -449,6 +459,44 @@ mod tests {
         let fixed = restore_sector_stamps(&with_tail).expect("layout matches");
         assert_eq!(fixed, clean);
         assert_eq!(Bucket::parse(&fixed).unwrap().slot(1).unwrap(), b"AB00123-45");
+    }
+
+    /// A stamped bucket of `sectors` sectors, every sector's stamped byte
+    /// originally 0x41, with a footer that restores it.
+    fn stamped_bucket_of(sectors: usize) -> Vec<u8> {
+        let size = sectors * STAMP_SECTOR_BYTES;
+        let footer = sectors / 2;
+        let mut b = vec![0u8; size];
+        b[0] = BUCKET_SIGNATURE;
+        b[1] = 0x42;
+        b[6..10].copy_from_slice(&(size as u32).to_le_bytes());
+        b[50..54].copy_from_slice(&(footer as u32).to_le_bytes());
+        for f in &mut b[size - footer..] {
+            *f = 0x11;
+        }
+        // Stamps last: in a bucket this large the footer spans whole
+        // sectors, whose stamped bytes are stamped like any other.
+        for k in 0..sectors {
+            b[k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR] = 0x49;
+        }
+        b
+    }
+
+    #[test]
+    fn an_oversized_declared_bucket_is_left_alone() {
+        // At the cap the layout is restored...
+        let at_cap = stamped_bucket_of(MAX_STAMPED_BUCKET_BYTES / STAMP_SECTOR_BYTES);
+        let fixed = restore_sector_stamps(&at_cap).expect("bucket at the cap");
+        assert_eq!(fixed[STAMP_OFFSET_IN_SECTOR], 0x41);
+        // ...and one that declares more is not copied, though every other
+        // condition holds and all of its bytes are present.
+        let over = stamped_bucket_of(MAX_STAMPED_BUCKET_BYTES / STAMP_SECTOR_BYTES + 2);
+        assert!(restore_sector_stamps(&over).is_none());
+        // A header that declares far more than the file holds is refused
+        // on its size alone.
+        let mut huge = stamped_bucket_of(4);
+        huge[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(restore_sector_stamps(&huge).is_none());
     }
 
     #[test]
