@@ -94,7 +94,8 @@ pub const STAMP_SECTOR_BYTES: usize = 512;
 pub const STAMP_OFFSET_IN_SECTOR: usize = 66;
 /// Largest declared bucket size [`restore_sector_stamps`] will copy. The
 /// size comes from the file, so a crafted header must not be able to ask
-/// for an arbitrary allocation; real summary buckets seen are 32 KiB.
+/// for an arbitrary allocation; real summary buckets seen are 32 KiB and
+/// 62 KiB.
 pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
 
 /// Undo the per-sector stamp of a bucket, returning a patched copy.
@@ -102,19 +103,25 @@ pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
 /// Observed on an ODS 52 database (local patch, not from libnsfdb): in each
 /// 512-byte sector of a summary bucket, the low nibble of the byte at sector
 /// offset 66 is overwritten with one stamp value shared by the whole bucket.
-/// The displaced nibbles are kept in the bucket footer, one per sector, in
-/// reverse sector order, low nibble of each footer byte first: the original
-/// of sector `k` (of `n`) is nibble `n - 1 - k` of the footer. Read raw, a
-/// stamped byte turns `-` into `)` in a value, or flips the summary flag of
-/// an item descriptor and shifts every later value of that note.
+/// The displaced nibbles are kept in the bucket footer, one per sector,
+/// counted back from the footer's end, low nibble of each footer byte
+/// first: with `m` nibbles in the footer, the original of sector `k` is
+/// nibble `m - 1 - k`. Read raw, a stamped byte turns `-` into `)` in a
+/// value, or flips the summary flag of an item descriptor and shifts every
+/// later value of that note.
+///
+/// The footer is not always exactly one nibble per sector. Two bucket sizes
+/// were seen in one database: 32768 bytes (64 sectors) with a 32-byte
+/// footer, and 63488 bytes (124 sectors) with a 64-byte footer, whose first
+/// four nibbles belong to no sector and are zero.
 ///
 /// `bytes` starts at the bucket and may run past it. Returns `None`, leaving
 /// the bucket to be read as it is, unless all of this holds:
 ///
 /// - the header parses, the declared size is at most
 ///   [`MAX_STAMPED_BUCKET_BYTES`], and the whole bucket is present;
-/// - the size is a whole number of sectors and the footer holds exactly one
-///   nibble per sector (`footer_size * 2 == size / 512`);
+/// - the size is a whole number of sectors and the footer holds a nibble
+///   for every sector, with fewer than 64 to spare, all of them zero;
 /// - every sector's byte at offset 66 carries the same low nibble (the
 ///   stamp), which a bucket without stamps does not do by accident unless
 ///   it is empty;
@@ -133,10 +140,15 @@ pub fn restore_sector_stamps(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     let sectors = size / STAMP_SECTOR_BYTES;
     let footer_size = header.footer_size as usize;
-    if footer_size.checked_mul(2)? != sectors {
+    let nibbles = footer_size.checked_mul(2)?;
+    if nibbles < sectors || nibbles - sectors >= 64 || footer_size > size {
         return None;
     }
     let footer = &bucket[size - footer_size..];
+    let nibble = |i: usize| (footer[i / 2] >> (4 * (i % 2))) & 0x0F;
+    if (0..nibbles - sectors).any(|i| nibble(i) != 0) {
+        return None;
+    }
     let stamp = bucket[STAMP_OFFSET_IN_SECTOR] & 0x0F;
     let at = |k: usize| k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR;
     if (0..sectors).any(|k| bucket[at(k)] & 0x0F != stamp) {
@@ -145,8 +157,7 @@ pub fn restore_sector_stamps(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = bucket.to_vec();
     let mut changed = false;
     for k in 0..sectors {
-        let i = sectors - 1 - k;
-        let original = (footer[i / 2] >> (4 * (i % 2))) & 0x0F;
+        let original = nibble(nibbles - 1 - k);
         let p = at(k);
         let restored = (bucket[p] & 0xF0) | original;
         changed |= restored != bucket[p];
@@ -480,6 +491,49 @@ mod tests {
             b[k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR] = 0x49;
         }
         b
+    }
+
+    /// A 124-sector bucket keeps a 64-byte footer: 128 nibbles, of which
+    /// the first four belong to no sector. The nibbles are counted from the
+    /// footer's end, so sector 0 is still the last one.
+    #[test]
+    fn a_footer_with_spare_nibbles_is_read_from_its_end() {
+        let sectors = 124usize;
+        let size = sectors * STAMP_SECTOR_BYTES;
+        let footer = 64usize;
+        let mut clean = vec![0u8; size];
+        clean[0] = BUCKET_SIGNATURE;
+        clean[1] = 0x42;
+        clean[6..10].copy_from_slice(&(size as u32).to_le_bytes());
+        clean[50..54].copy_from_slice(&(footer as u32).to_le_bytes());
+        // A different original in every sector, so a wrong order shows.
+        for k in 0..sectors {
+            clean[k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR] = 0x40 | (k % 16) as u8;
+        }
+        let mut stamped = clean.clone();
+        let nibbles = footer * 2;
+        for k in 0..sectors {
+            let p = k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR;
+            let i = nibbles - 1 - k;
+            stamped[size - footer + i / 2] |= (clean[p] & 0x0F) << (4 * (i % 2));
+            stamped[p] = (clean[p] & 0xF0) | 0x02;
+        }
+        clean[size - footer..].copy_from_slice(&stamped[size - footer..]);
+        assert_eq!(&stamped[size - footer..size - footer + 2], &[0, 0], "spare nibbles are zero");
+        assert_eq!(restore_sector_stamps(&stamped).expect("layout matches"), clean);
+
+        // Spare nibbles that are not zero: not this layout.
+        let mut odd = stamped.clone();
+        odd[size - footer] = 0x01;
+        assert!(restore_sector_stamps(&odd).is_none());
+        // A footer too short to hold a nibble per sector.
+        let mut short = stamped.clone();
+        short[50..54].copy_from_slice(&32u32.to_le_bytes());
+        assert!(restore_sector_stamps(&short).is_none());
+        // A footer with far more nibbles than sectors.
+        let mut long = stamped;
+        long[50..54].copy_from_slice(&128u32.to_le_bytes());
+        assert!(restore_sector_stamps(&long).is_none());
     }
 
     #[test]
