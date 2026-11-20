@@ -54,6 +54,8 @@ pub struct Database<'a> {
     file_positions: std::sync::OnceLock<std::collections::HashMap<u32, u64>>,
     /// Item name ids of `$FILE`, built on first use from the BDB.
     file_name_ids: std::sync::OnceLock<Vec<u16>>,
+    /// Item name ids of `$Seal` and `$SealData`, built on first use.
+    seal_name_ids: std::sync::OnceLock<Vec<u16>>,
     /// Raw summary-bucket descriptors, built on first use. See
     /// [`Self::summary_bucket_raw_fps`].
     summary_fps: std::sync::OnceLock<Vec<u32>>,
@@ -117,6 +119,7 @@ impl<'a> Database<'a> {
             header,
             file_positions: Default::default(),
             file_name_ids: Default::default(),
+            seal_name_ids: Default::default(),
             summary_fps: Default::default(),
             restored_buckets: Default::default(),
             restored_bytes: Default::default(),
@@ -220,35 +223,61 @@ impl<'a> Database<'a> {
         self.record(note)
     }
 
-    /// Name ids whose field name is `$FILE`.
-    fn file_name_ids(&self) -> &[u16] {
-        self.file_name_ids.get_or_init(|| {
-            self.bucket_descriptor_block()
-                .ok()
-                .flatten()
-                .map(|bdb| {
-                    bdb.unk_names
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, n)| n.eq_ignore_ascii_case("$FILE"))
-                        .filter_map(|(i, _)| u16::try_from(i).ok())
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
+    /// Name ids whose field name is one of `names` (any case).
+    fn name_ids(&self, names: &[&str]) -> Vec<u16> {
+        self.bucket_descriptor_block()
+            .ok()
+            .flatten()
+            .map(|bdb| {
+                bdb.unk_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| names.iter().any(|w| n.eq_ignore_ascii_case(w)))
+                    .filter_map(|(i, _)| u16::try_from(i).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// The note's `$FILE` descriptors, in item order.
+    /// Name ids whose field name is `$FILE`.
+    fn file_name_ids(&self) -> &[u16] {
+        self.file_name_ids.get_or_init(|| self.name_ids(&["$FILE"]))
+    }
+
+    /// Whether the note is sealed (encrypted): it has a `$Seal` or
+    /// `$SealData` item, which is where Notes keeps the encrypted note key.
+    /// The items flagged [`crate::item::ITEM_SEAL`] are encrypted only in
+    /// such a note; the flag itself is set on unencrypted items too.
+    ///
+    /// A database whose field-name table has neither name holds no sealed
+    /// note, which is how a database with 25,463 seal-flagged `$FILE` items
+    /// and every one of them decoding was shown to be unencrypted.
+    pub fn note_is_sealed(&self, note: &ResolvedNote) -> bool {
+        let ids = self.seal_name_ids.get_or_init(|| self.name_ids(&["$Seal", "$SealData"]));
+        if ids.is_empty() {
+            return false;
+        }
+        // An item counts whether or not its value was reached: the name in
+        // the item table is the evidence.
+        let walk = self.note_items_walk(note);
+        walk.items.iter().any(|it| ids.contains(&it.name_id))
+            || walk.unreached.iter().any(|u| ids.contains(&u.name_id))
+    }
+
+    /// The note's `$FILE` descriptors, in item order, each marked encrypted
+    /// when it is sealable and the note is sealed.
     pub fn file_objects(&self, note: &ResolvedNote) -> Vec<crate::item::FileObject> {
         let ids = self.file_name_ids();
         if ids.is_empty() {
             return Vec::new();
         }
+        let sealed = self.note_is_sealed(note);
         self.note_items_walk(note)
             .items
             .iter()
             .filter(|it| ids.contains(&it.name_id))
             .filter_map(|it| it.as_file_object())
+            .map(|fo| fo.in_note(sealed))
             .collect()
     }
 

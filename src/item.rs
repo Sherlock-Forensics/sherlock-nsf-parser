@@ -553,7 +553,8 @@ impl NoteItem<'_> {
             created: Timedate::from_bytes(v.get(20..28)?).ok(),
             modified: Timedate::from_bytes(v.get(28..36)?).ok(),
             name: crate::lmbcs::decode(name),
-            encrypted: self.type_flags & ITEM_SEAL != 0,
+            sealable: self.type_flags & ITEM_SEAL != 0,
+            encrypted: false,
         })
     }
 
@@ -592,10 +593,25 @@ pub struct FileObject {
     pub modified: Option<Timedate>,
     /// File name as attached, decoded from LMBCS.
     pub name: String,
-    /// The item is sealed ([`ITEM_SEAL`]): the object holds the file
-    /// encrypted to the recipients' Notes IDs, and the descriptor alone is
-    /// readable.
+    /// The item carries [`ITEM_SEAL`]: encryption of the note would cover
+    /// this file. Notes sets it on `$FILE` items as a matter of course - all
+    /// 25,463 in a database with no encrypted note carry it, together with
+    /// the sign and summary flags - so on its own it says nothing about
+    /// whether the file IS encrypted.
+    pub sealable: bool,
+    /// The file is encrypted: the item is [`Self::sealable`] and its note is
+    /// sealed. Only [`crate::Database::file_objects`], which sees the note,
+    /// sets it; [`NoteItem::as_file_object`] alone leaves it `false`.
     pub encrypted: bool,
+}
+
+impl FileObject {
+    /// This descriptor as found in a note that is, or is not, sealed (see
+    /// [`crate::Database::note_is_sealed`]).
+    pub fn in_note(mut self, note_sealed: bool) -> Self {
+        self.encrypted = self.sealable && note_sealed;
+        self
+    }
 }
 
 /// One TIMEDATE as ISO 8601, or its hex when it is not a clock value (an
@@ -837,7 +853,10 @@ pub fn walk_items_at<'a>(
 /// be found.
 pub const ITEM_SUMMARY: u16 = 0x0004;
 
-/// Field flag: the value is sealed (encrypted). On a `$FILE` the
+/// Field flag: encrypting the note would encrypt this item. It is set on
+/// items that are not encrypted too (every `$FILE` carries it); a value is
+/// encrypted only in a sealed note (see
+/// [`crate::Database::note_is_sealed`]). In a sealed note a `$FILE`
 /// descriptor stays in the clear and the object it names is encrypted.
 pub const ITEM_SEAL: u16 = 0x0002;
 
@@ -1110,16 +1129,21 @@ mod typed_value_tests {
         assert_eq!(fo.name, "Poro\u{10d}ilo za \u{e4}o.pdf");
     }
 
-    /// A sealed `$FILE` keeps its descriptor readable; only the object is
-    /// encrypted. The flag is what lets a failure say so.
+    /// ITEM_SEAL on a `$FILE` is set whether or not anything is encrypted;
+    /// the file is encrypted only when its note is sealed as well.
     #[test]
-    fn a_sealed_file_item_is_marked_encrypted() {
+    fn a_seal_flag_alone_does_not_make_a_file_encrypted() {
         let v = file_value("Budget.xls");
         let plain = item(ITEM_NO_TYPE_WORD, &v).as_file_object().expect("descriptor");
-        assert!(!plain.encrypted);
+        assert!(!plain.sealable && !plain.encrypted);
         assert_eq!((plain.object_rrv, plain.size, plain.name.as_str()), (52654, 5131, "Budget.xls"));
+        assert!(!plain.clone().in_note(true).encrypted);
+
         let sealed = item(ITEM_NO_TYPE_WORD | ITEM_SEAL, &v).as_file_object().expect("descriptor");
-        assert!(sealed.encrypted);
+        assert!(sealed.sealable);
+        assert!(!sealed.encrypted);
+        assert!(!sealed.clone().in_note(false).encrypted);
+        assert!(sealed.clone().in_note(true).encrypted);
         assert_eq!(sealed.name, "Budget.xls");
     }
 
