@@ -88,6 +88,84 @@ impl BucketHeader {
     }
 }
 
+/// Size of the on-disk sector the per-sector stamp is laid out on.
+pub const STAMP_SECTOR_BYTES: usize = 512;
+/// Offset inside each sector of the byte whose low nibble carries the stamp.
+pub const STAMP_OFFSET_IN_SECTOR: usize = 66;
+/// Largest declared bucket size [`restore_sector_stamps`] will copy. The
+/// size comes from the file, so a crafted header must not be able to ask
+/// for an arbitrary allocation; real summary buckets seen are 32 KiB and
+/// 62 KiB.
+pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
+
+/// Undo the per-sector stamp of a bucket, returning a patched copy.
+///
+/// Observed on an ODS 52 database (local patch, not from libnsfdb): in each
+/// 512-byte sector of a summary bucket, the low nibble of the byte at sector
+/// offset 66 is overwritten with one stamp value shared by the whole bucket.
+/// The displaced nibbles are kept in the bucket footer, one per sector,
+/// counted back from the footer's end, low nibble of each footer byte
+/// first: with `m` nibbles in the footer, the original of sector `k` is
+/// nibble `m - 1 - k`. Read raw, a stamped byte turns `-` into `)` in a
+/// value, or flips the summary flag of an item descriptor and shifts every
+/// later value of that note.
+///
+/// The footer is not always exactly one nibble per sector. Two bucket sizes
+/// were seen in one database: 32768 bytes (64 sectors) with a 32-byte
+/// footer, and 63488 bytes (124 sectors) with a 64-byte footer, whose first
+/// four nibbles belong to no sector and are zero.
+///
+/// `bytes` starts at the bucket and may run past it. Returns `None`, leaving
+/// the bucket to be read as it is, unless all of this holds:
+///
+/// - the header parses, the declared size is at most
+///   [`MAX_STAMPED_BUCKET_BYTES`], and the whole bucket is present;
+/// - the size is a whole number of sectors and the footer holds a nibble
+///   for every sector, with fewer than 64 to spare, all of them zero;
+/// - every sector's byte at offset 66 carries the same low nibble (the
+///   stamp), which a bucket without stamps does not do by accident unless
+///   it is empty;
+/// - restoring changes at least one byte.
+pub fn restore_sector_stamps(bytes: &[u8]) -> Option<Vec<u8>> {
+    let header = BucketHeader::parse(bytes).ok()?;
+    let size = header.size as usize;
+    // The size is whatever the file says. Refuse to copy more than a
+    // bucket can plausibly be before looking at anything else.
+    if size > MAX_STAMPED_BUCKET_BYTES {
+        return None;
+    }
+    let bucket = bytes.get(..size)?;
+    if size == 0 || size % STAMP_SECTOR_BYTES != 0 {
+        return None;
+    }
+    let sectors = size / STAMP_SECTOR_BYTES;
+    let footer_size = header.footer_size as usize;
+    let nibbles = footer_size.checked_mul(2)?;
+    if nibbles < sectors || nibbles - sectors >= 64 || footer_size > size {
+        return None;
+    }
+    let footer = &bucket[size - footer_size..];
+    let nibble = |i: usize| (footer[i / 2] >> (4 * (i % 2))) & 0x0F;
+    if (0..nibbles - sectors).any(|i| nibble(i) != 0) {
+        return None;
+    }
+    let stamp = bucket[STAMP_OFFSET_IN_SECTOR] & 0x0F;
+    let at = |k: usize| k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR;
+    if (0..sectors).any(|k| bucket[at(k)] & 0x0F != stamp) {
+        return None;
+    }
+    let mut out = bucket.to_vec();
+    let mut changed = false;
+    for k in 0..sectors {
+        let original = nibble(nibbles - 1 - k);
+        let p = at(k);
+        let restored = (bucket[p] & 0xF0) | original;
+        changed |= restored != bucket[p];
+        out[p] = restored;
+    }
+    changed.then_some(out)
+}
+
 /// One entry of a bucket's slot-index table: where a slot's bytes live
 /// inside the bucket and how many bytes they span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +422,152 @@ mod tests {
         buf[86..88].copy_from_slice(&250u16.to_le_bytes());
         let bucket = Bucket::parse(&buf).unwrap();
         assert!(matches!(bucket.slot(1), Err(NsfError::TooShort { .. })));
+    }
+
+    /// A 2048-byte bucket (4 sectors, 2-byte footer) holding one slot whose
+    /// text crosses the stamped byte of sector 1, stamped with nibble 9.
+    fn stamped_bucket() -> (Vec<u8>, Vec<u8>) {
+        let size = 2048usize;
+        let mut clean = vec![0u8; size];
+        clean[0] = BUCKET_SIGNATURE;
+        clean[1] = 0x42;
+        clean[6..10].copy_from_slice(&(size as u32).to_le_bytes());
+        clean[44..48].copy_from_slice(&1u32.to_le_bytes());
+        clean[50..54].copy_from_slice(&2u32.to_le_bytes());
+        // "AB00123-45" placed so that '-' sits at sector 1, offset 66.
+        let text = b"AB00123-45";
+        let start = 512 + 66 - 7;
+        clean[start..start + text.len()].copy_from_slice(text);
+        clean[1024 + 66] = 0x6C; // 'l' in sector 2
+        clean[1536 + 66] = 0x8E; // sector 3
+        // slot 1 entry sits just below the footer.
+        let table = size - 2 - 4;
+        clean[table..table + 2].copy_from_slice(&(start as u16).to_le_bytes());
+        clean[table + 2..table + 4].copy_from_slice(&(text.len() as u16).to_le_bytes());
+
+        let mut stamped = clean.clone();
+        let mut footer = [0u8; 2];
+        for k in 0..4usize {
+            let p = k * 512 + 66;
+            let i = 3 - k;
+            footer[i / 2] |= (clean[p] & 0x0F) << (4 * (i % 2));
+            stamped[p] = (clean[p] & 0xF0) | 0x09;
+        }
+        stamped[size - 2..].copy_from_slice(&footer);
+        clean[size - 2..].copy_from_slice(&footer);
+        (stamped, clean)
+    }
+
+    #[test]
+    fn a_stamped_bucket_is_restored_from_its_footer() {
+        let (stamped, clean) = stamped_bucket();
+        // Read raw, the slot shows the stamp.
+        let raw = Bucket::parse(&stamped).unwrap();
+        assert_eq!(raw.slot(1).unwrap(), b"AB00123)45");
+        // Trailing bytes of a neighbour must not matter.
+        let mut with_tail = stamped.clone();
+        with_tail.extend_from_slice(&[0x77; 100]);
+        let fixed = restore_sector_stamps(&with_tail).expect("layout matches");
+        assert_eq!(fixed, clean);
+        assert_eq!(Bucket::parse(&fixed).unwrap().slot(1).unwrap(), b"AB00123-45");
+    }
+
+    /// A stamped bucket of `sectors` sectors, every sector's stamped byte
+    /// originally 0x41, with a footer that restores it.
+    fn stamped_bucket_of(sectors: usize) -> Vec<u8> {
+        let size = sectors * STAMP_SECTOR_BYTES;
+        let footer = sectors / 2;
+        let mut b = vec![0u8; size];
+        b[0] = BUCKET_SIGNATURE;
+        b[1] = 0x42;
+        b[6..10].copy_from_slice(&(size as u32).to_le_bytes());
+        b[50..54].copy_from_slice(&(footer as u32).to_le_bytes());
+        for f in &mut b[size - footer..] {
+            *f = 0x11;
+        }
+        // Stamps last: in a bucket this large the footer spans whole
+        // sectors, whose stamped bytes are stamped like any other.
+        for k in 0..sectors {
+            b[k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR] = 0x49;
+        }
+        b
+    }
+
+    /// A 124-sector bucket keeps a 64-byte footer: 128 nibbles, of which
+    /// the first four belong to no sector. The nibbles are counted from the
+    /// footer's end, so sector 0 is still the last one.
+    #[test]
+    fn a_footer_with_spare_nibbles_is_read_from_its_end() {
+        let sectors = 124usize;
+        let size = sectors * STAMP_SECTOR_BYTES;
+        let footer = 64usize;
+        let mut clean = vec![0u8; size];
+        clean[0] = BUCKET_SIGNATURE;
+        clean[1] = 0x42;
+        clean[6..10].copy_from_slice(&(size as u32).to_le_bytes());
+        clean[50..54].copy_from_slice(&(footer as u32).to_le_bytes());
+        // A different original in every sector, so a wrong order shows.
+        for k in 0..sectors {
+            clean[k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR] = 0x40 | (k % 16) as u8;
+        }
+        let mut stamped = clean.clone();
+        let nibbles = footer * 2;
+        for k in 0..sectors {
+            let p = k * STAMP_SECTOR_BYTES + STAMP_OFFSET_IN_SECTOR;
+            let i = nibbles - 1 - k;
+            stamped[size - footer + i / 2] |= (clean[p] & 0x0F) << (4 * (i % 2));
+            stamped[p] = (clean[p] & 0xF0) | 0x02;
+        }
+        clean[size - footer..].copy_from_slice(&stamped[size - footer..]);
+        assert_eq!(&stamped[size - footer..size - footer + 2], &[0, 0], "spare nibbles are zero");
+        assert_eq!(restore_sector_stamps(&stamped).expect("layout matches"), clean);
+
+        // Spare nibbles that are not zero: not this layout.
+        let mut odd = stamped.clone();
+        odd[size - footer] = 0x01;
+        assert!(restore_sector_stamps(&odd).is_none());
+        // A footer too short to hold a nibble per sector.
+        let mut short = stamped.clone();
+        short[50..54].copy_from_slice(&32u32.to_le_bytes());
+        assert!(restore_sector_stamps(&short).is_none());
+        // A footer with far more nibbles than sectors.
+        let mut long = stamped;
+        long[50..54].copy_from_slice(&128u32.to_le_bytes());
+        assert!(restore_sector_stamps(&long).is_none());
+    }
+
+    #[test]
+    fn an_oversized_declared_bucket_is_left_alone() {
+        // At the cap the layout is restored...
+        let at_cap = stamped_bucket_of(MAX_STAMPED_BUCKET_BYTES / STAMP_SECTOR_BYTES);
+        let fixed = restore_sector_stamps(&at_cap).expect("bucket at the cap");
+        assert_eq!(fixed[STAMP_OFFSET_IN_SECTOR], 0x41);
+        // ...and one that declares more is not copied, though every other
+        // condition holds and all of its bytes are present.
+        let over = stamped_bucket_of(MAX_STAMPED_BUCKET_BYTES / STAMP_SECTOR_BYTES + 2);
+        assert!(restore_sector_stamps(&over).is_none());
+        // A header that declares far more than the file holds is refused
+        // on its size alone.
+        let mut huge = stamped_bucket_of(4);
+        huge[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(restore_sector_stamps(&huge).is_none());
+    }
+
+    #[test]
+    fn a_bucket_that_does_not_match_the_stamp_layout_is_left_alone() {
+        let (stamped, _) = stamped_bucket();
+        // Footer does not hold one nibble per sector.
+        let mut other_footer = stamped.clone();
+        other_footer[50..54].copy_from_slice(&12u32.to_le_bytes());
+        assert!(restore_sector_stamps(&other_footer).is_none());
+        // Sectors disagree on the stamp nibble.
+        let mut mixed = stamped.clone();
+        mixed[1024 + 66] ^= 0x01;
+        assert!(restore_sector_stamps(&mixed).is_none());
+        // Bucket not wholly present.
+        assert!(restore_sector_stamps(&stamped[..2000]).is_none());
+        // The classic 12-byte-footer bucket of the other tests.
+        assert!(restore_sector_stamps(&synthetic_bucket_with_slots()).is_none());
     }
 
     #[test]

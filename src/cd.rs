@@ -257,7 +257,8 @@ fn hotspot_file_name(body: &[u8]) -> Option<String> {
     let data = body.get(8..)?;
     let data = &data[..len.min(data.len())];
     let unique = data.split(|&b| b == 0).next()?;
-    (!unique.is_empty()).then(|| String::from_utf8_lossy(unique).into_owned())
+    // LMBCS, as the `$FILE` name it must match is.
+    (!unique.is_empty()).then(|| crate::lmbcs::decode(unique))
 }
 
 /// Parse a non-summary object into its rich-text body + attachments.
@@ -271,11 +272,19 @@ pub fn parse(obj: &[u8]) -> NoteContent {
 /// word, then CD records; each is walked on its own so one item's padding
 /// cannot shift the next item's records.
 pub fn parse_items(values: &[&[u8]]) -> NoteContent {
+    let streams: Vec<&[u8]> = values.iter().filter_map(|v| v.get(2..)).collect();
+    parse_values(&streams)
+}
+
+/// Parse rich-text values that are bare CD records, with no type word and
+/// no object header: the non-summary items of a modern note once located
+/// (see [`crate::Database::non_summary_values`]). Each value is walked on
+/// its own and the records are then read as one sequence, since a body or
+/// an image may continue across several items of the same name.
+pub fn parse_values(values: &[&[u8]]) -> NoteContent {
     let mut recs = Vec::new();
     for v in values {
-        if let Some(stream) = v.get(2..) {
-            recs.extend(walk_from(stream, 0));
-        }
+        recs.extend(walk_from(v, 0));
     }
     parse_records(recs)
 }
@@ -283,8 +292,8 @@ pub fn parse_items(values: &[&[u8]]) -> NoteContent {
 fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
     let mut content = NoteContent::default();
 
-    // Body text: concatenate CDTEXT runs (4-byte FONTID prefix, then LMBCS;
-    // we emit printable ASCII and treat NUL as a run separator). The FONTID
+    // Body text: concatenate CDTEXT runs (4-byte FONTID prefix, then LMBCS,
+    // decoded to Unicode, a NUL being a line break). The FONTID
     // prefix the flattened text skips carries the emphasis, so the same pass
     // records the runs it was flattened from.
     let mut pending_break = false;
@@ -296,13 +305,19 @@ fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
         // FONTIDFIELDS: Face, Attrib, Color, PointSize.
         let style = RunStyle::from_attrib(r.body.get(1).copied().unwrap_or(0));
         let text = r.body.get(4..).unwrap_or(&[]);
-        let mut run = String::new();
-        for &b in text {
-            match b {
-                0x09 | 0x0A | 0x0D | 0x20..=0x7E => run.push(b as char),
-                _ => {}
-            }
-        }
+        // The text is LMBCS, as item values are. Dropping every byte that
+        // is not printable ASCII, as this once did, silently removed each
+        // accented letter: a word came out shorter, and still looked like
+        // a word. A NUL is Notes' line break inside a run.
+        let run: String = crate::lmbcs::decode(text)
+            .chars()
+            .filter_map(|c| match c {
+                '\0' => Some('\n'),
+                '\t' | '\n' | '\r' => Some(c),
+                c if c.is_control() => None,
+                c => Some(c),
+            })
+            .collect();
         content.body_text.push_str(&run);
         content.body_text.push('\n');
         if !run.is_empty() {
@@ -385,6 +400,18 @@ fn parse_records(recs: Vec<CdRecord<'_>>) -> NoteContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CDTEXT run keeps its accented letters: bare high bytes are code
+    /// page 850, group 6 is code page 852, and a NUL breaks the line.
+    #[test]
+    fn body_text_is_decoded_from_lmbcs() {
+        let text: &[u8] = b"f\x81r me\x06\xE7al\x00x";
+        let mut rec = vec![SIG_TEXT, (2 + 4 + text.len()) as u8, 0, 0, 0, 0];
+        rec.extend_from_slice(text);
+        let content = parse_values(&[&rec]);
+        assert_eq!(content.body_text, "f\u{fc}r me\u{161}al\nx");
+        assert_eq!(content.runs[0].text, "f\u{fc}r me\u{161}al\nx");
+    }
 
     #[test]
     fn walk_empty_object_is_safe() {
@@ -522,6 +549,15 @@ mod run_tests {
         assert_eq!(a.name, "ATT12345.xls");
         assert!(a.data.is_empty(), "the icon carries no bytes");
         assert_eq!(a.kind, AttachmentKind::File);
+    }
+
+    /// The icon's name is LMBCS like the `$FILE` name it is matched with.
+    #[test]
+    fn a_file_hotspot_name_is_decoded_from_lmbcs() {
+        let mut obj = vec![0u8; CD_STREAM_START];
+        obj.extend(hotspot(HOTSPOT_TYPE_FILE, b"Ra\x06\xE7un.pdf\0"));
+        let content = parse(&obj);
+        assert_eq!(content.attachments[0].name, "Ra\u{161}un.pdf");
     }
 
     /// A customer's Notes 4 mail file reported 8,450 attachments with no
