@@ -97,6 +97,9 @@ pub const STAMP_OFFSET_IN_SECTOR: usize = 66;
 /// for an arbitrary allocation; real summary buckets seen are 32 KiB and
 /// 62 KiB.
 pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
+/// The footer's nibble array is padded to a multiple of this many nibbles
+/// (4 bytes). Only that padding may hold leftovers.
+const FOOTER_PADDING_NIBBLES: usize = 8;
 
 /// Undo the per-sector stamp of a bucket, returning a patched copy.
 ///
@@ -113,7 +116,16 @@ pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
 /// The footer is not always exactly one nibble per sector. Two bucket sizes
 /// were seen in one database: 32768 bytes (64 sectors) with a 32-byte
 /// footer, and 63488 bytes (124 sectors) with a 64-byte footer, whose first
-/// four nibbles belong to no sector and are zero.
+/// four nibbles belong to no sector. They are usually zero, but not always:
+/// in a second database (reported as ODS 43, 1.1 GB) 299 of the 990 such
+/// buckets held other values there while every sector carried one stamp.
+/// Restoring them removed every remaining one-character error in the form
+/// names (408 notes), resolved 332 more notes, and introduced no new
+/// anomaly. Those four nibbles are exactly the padding that rounds 124 up
+/// to a multiple of [`FOOTER_PADDING_NIBBLES`], so spare nibbles are left
+/// unchecked only when their count is that padding. Any other spare count
+/// still requires zeros, so a footer of the wrong size is not taken for a
+/// stamp footer.
 ///
 /// `bytes` starts at the bucket and may run past it. Returns `None`, leaving
 /// the bucket to be read as it is, unless all of this holds:
@@ -121,7 +133,8 @@ pub const MAX_STAMPED_BUCKET_BYTES: usize = 1 << 20;
 /// - the header parses, the declared size is at most
 ///   [`MAX_STAMPED_BUCKET_BYTES`], and the whole bucket is present;
 /// - the size is a whole number of sectors and the footer holds a nibble
-///   for every sector, with fewer than 64 to spare, all of them zero;
+///   for every sector, with fewer than 64 to spare, all of them zero
+///   unless their count is exactly the padding to a multiple of 8;
 /// - every sector's byte at offset 66 carries the same low nibble (the
 ///   stamp), which a bucket without stamps does not do by accident unless
 ///   it is empty;
@@ -146,7 +159,9 @@ pub fn restore_sector_stamps(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     let footer = &bucket[size - footer_size..];
     let nibble = |i: usize| (footer[i / 2] >> (4 * (i % 2))) & 0x0F;
-    if (0..nibbles - sectors).any(|i| nibble(i) != 0) {
+    let spare = nibbles - sectors;
+    let padding = sectors.next_multiple_of(FOOTER_PADDING_NIBBLES) - sectors;
+    if spare != padding && (0..spare).any(|i| nibble(i) != 0) {
         return None;
     }
     let stamp = bucket[STAMP_OFFSET_IN_SECTOR] & 0x0F;
@@ -522,10 +537,19 @@ mod tests {
         assert_eq!(&stamped[size - footer..size - footer + 2], &[0, 0], "spare nibbles are zero");
         assert_eq!(restore_sector_stamps(&stamped).expect("layout matches"), clean);
 
-        // Spare nibbles that are not zero: not this layout.
+        // Spare nibbles that are not zero are leftovers: they belong to no
+        // sector, are kept as they are, and do not stop the restore.
         let mut odd = stamped.clone();
-        odd[size - footer] = 0x01;
-        assert!(restore_sector_stamps(&odd).is_none());
+        odd[size - footer] = 0x8C;
+        let mut odd_clean = clean.clone();
+        odd_clean[size - footer] = 0x8C;
+        assert_eq!(restore_sector_stamps(&odd).expect("leftover spare nibbles"), odd_clean);
+        // A footer two bytes longer: 8 spare nibbles is not the padding of
+        // 124 sectors, so a non-zero spare nibble refuses it.
+        let mut longer = stamped.clone();
+        longer[50..54].copy_from_slice(&((footer + 2) as u32).to_le_bytes());
+        longer[size - footer - 2] = 0x01;
+        assert!(restore_sector_stamps(&longer).is_none());
         // A footer too short to hold a nibble per sector.
         let mut short = stamped.clone();
         short[50..54].copy_from_slice(&32u32.to_le_bytes());
@@ -560,6 +584,12 @@ mod tests {
         let mut other_footer = stamped.clone();
         other_footer[50..54].copy_from_slice(&12u32.to_le_bytes());
         assert!(restore_sector_stamps(&other_footer).is_none());
+        // Four sectors pad to 8 nibbles, but a 3-byte footer has 2 spare:
+        // a misaligned spare count with a non-zero nibble is refused.
+        let mut misaligned = stamped.clone();
+        misaligned[50..54].copy_from_slice(&3u32.to_le_bytes());
+        misaligned[2048 - 3] = 0x01;
+        assert!(restore_sector_stamps(&misaligned).is_none());
         // Sectors disagree on the stamp nibble.
         let mut mixed = stamped.clone();
         mixed[1024 + 66] ^= 0x01;
