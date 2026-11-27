@@ -54,6 +54,10 @@ const MIN_MATCH_LENGTH: u32 = 2;
 /// terminator after 8 data bits.
 const MAX_RUN_WIDTH: u32 = 9;
 
+/// High bit of a chained segment's length word: the segment is stored
+/// uncompressed. See [`decompress_chained`].
+const STORED_SEGMENT_FLAG: u32 = 0x8000_0000;
+
 /// LSB-first bit reader over a borrowed byte slice.
 struct BitReader<'a> {
     data: &'a [u8],
@@ -134,6 +138,16 @@ impl<'a> BitReader<'a> {
 /// header and [`NsfError::DecompressionFailed`] for a truncated stream,
 /// an out-of-bounds back-reference, or output overflowing `expected_size`.
 pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>, NsfError> {
+    decompress_bounded(compressed, expected_size, false)
+}
+
+/// [`decompress`], except that with `stop_at_size` output reaching
+/// `expected_size` ends the stream instead of failing it.
+fn decompress_bounded(
+    compressed: &[u8],
+    expected_size: usize,
+    stop_at_size: bool,
+) -> Result<Vec<u8>, NsfError> {
     let first = *compressed.first().ok_or(NsfError::DecompressionFailed {
         detail: "empty compressed stream",
     })?;
@@ -148,6 +162,11 @@ pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>, Ns
     let mut reader = BitReader::new(compressed, START_BIT_INDEX);
 
     while !reader.exhausted() {
+        // Output at the declared size ends the stream before the next token
+        // is read, so a token past that size can neither fail nor add.
+        if stop_at_size && out.len() >= expected_size {
+            break;
+        }
         let tag = reader.read_bit()?;
         if tag == 0 {
             // Literal byte.
@@ -190,11 +209,16 @@ pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>, Ns
                 detail: "back-reference offset points before start of output",
             });
         }
-        if out.len() + length > expected_size {
-            return Err(NsfError::DecompressionFailed {
-                detail: "back-reference would exceed declared uncompressed size",
-            });
-        }
+        let length = if out.len() + length > expected_size {
+            if !stop_at_size {
+                return Err(NsfError::DecompressionFailed {
+                    detail: "back-reference would exceed declared uncompressed size",
+                });
+            }
+            expected_size - out.len()
+        } else {
+            length
+        };
         // Byte-by-byte copy so overlapping runs (offset < length) replicate.
         for _ in 0..length {
             let src = out.len() - offset;
@@ -222,6 +246,25 @@ pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>, Ns
 /// the body is exhausted - so a single-segment body (the common superblock
 /// case) round-trips identically to feeding [`decompress`] the lone stream.
 ///
+/// A length word with its high bit set ([`STORED_SEGMENT_FLAG`]) marks a
+/// segment stored as is, without compression; its bytes are copied. A
+/// Bucket Descriptor Block of a 1 GB database had one such segment of 16
+/// bytes among 23 compressed ones. Read as a length, the flag made the
+/// segment 2 GB long, and the database had no field names or notes. A
+/// stored segment that is empty or longer than the declared size leaves is
+/// refused.
+///
+/// The last segment - one with nothing or a zero length word after it -
+/// may decode to a few bytes more than the declared size leaves for it;
+/// those bytes are dropped. Any earlier segment that does so still fails
+/// the body. Both superblock copies of a
+/// 9 GB log database decoded 8 bytes past their declared size, in the
+/// final tokens of the last segment, while the descriptor array the
+/// superblock is read for ends 100 KB earlier. Failing the whole body
+/// there left the database unreadable. Output that reaches the declared
+/// size ends the chain, so only bytes past that size are ever dropped;
+/// [`decompress`] on a single stream still refuses them.
+///
 /// libnsfdb does not implement this chaining (its BDB reader leaves the
 /// length prefix as a `TODO` and only ever decodes the first segment); it
 /// was reverse-engineered against the Unique Name Key text region, whose
@@ -233,8 +276,17 @@ pub fn decompress_chained(body: &[u8], expected_size: usize) -> Result<Vec<u8>, 
         let Some(len_bytes) = body.get(cursor..cursor + 4) else {
             break;
         };
-        let seg_len =
-            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        let word = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]);
+        let stored = word & STORED_SEGMENT_FLAG != 0;
+        let seg_len = (word & !STORED_SEGMENT_FLAG) as usize;
+        let remaining = expected_size - out.len();
+        if stored && (seg_len == 0 || seg_len > remaining) {
+            // A stored segment holds output bytes one for one, so it can be
+            // neither empty nor longer than what the declared size leaves.
+            return Err(NsfError::DecompressionFailed {
+                detail: "stored CX segment does not fit the declared size",
+            });
+        }
         if seg_len == 0 {
             break;
         }
@@ -248,8 +300,17 @@ pub fn decompress_chained(body: &[u8], expected_size: usize) -> Result<Vec<u8>, 
             actual: body.len(),
             required: seg_end,
         })?;
-        let remaining = expected_size - out.len();
-        let part = decompress(seg, remaining)?;
+        // Only the last segment - nothing or a zero word after it - may run
+        // past the declared size; an earlier one doing so means the size or
+        // the segmentation was misread.
+        let last = body
+            .get(seg_end..seg_end + 4)
+            .map_or(true, |w| w == [0, 0, 0, 0]);
+        let part = if stored {
+            seg.to_vec()
+        } else {
+            decompress_bounded(seg, remaining, last)?
+        };
         if part.is_empty() {
             break;
         }
@@ -262,6 +323,91 @@ pub fn decompress_chained(body: &[u8], expected_size: usize) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack `(value, width)` fields LSB-first after the mode bits.
+    fn stream(fields: &[(u32, u8)]) -> Vec<u8> {
+        let mut out = vec![0b100u8];
+        let mut bit = START_BIT_INDEX as usize;
+        for &(value, width) in fields {
+            for i in 0..width {
+                if bit / 8 == out.len() {
+                    out.push(0);
+                }
+                if value >> i & 1 == 1 {
+                    out[bit / 8] |= 1 << (bit % 8);
+                }
+                bit += 1;
+            }
+        }
+        out
+    }
+
+    /// "ABC" as literals, then a minimum-length back-reference 3 back:
+    /// "ABCAB", exactly 40 bits.
+    fn abcab() -> Vec<u8> {
+        let lit = |c: u8| [(0, 1), (u32::from(c), 8)];
+        let mut f: Vec<(u32, u8)> = Vec::new();
+        for c in *b"ABC" {
+            f.extend(lit(c));
+        }
+        f.extend([(1, 1), (1, 1), (3, 8)]);
+        stream(&f)
+    }
+
+    #[test]
+    fn a_stream_past_its_declared_size_fails_alone_but_ends_a_chain() {
+        let s = abcab();
+        assert_eq!(decompress(&s, 5).unwrap(), b"ABCAB");
+        assert!(matches!(decompress(&s, 4), Err(NsfError::DecompressionFailed { .. })));
+        let mut chain = (s.len() as u32).to_le_bytes().to_vec();
+        chain.extend(&s);
+        assert_eq!(decompress_chained(&chain, 4).unwrap(), b"ABCA");
+        assert_eq!(decompress_chained(&chain, 2).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn a_segment_flagged_as_stored_is_copied_as_is() {
+        let s = abcab();
+        let mut chain = (s.len() as u32).to_le_bytes().to_vec();
+        chain.extend(&s);
+        chain.extend((3u32 | STORED_SEGMENT_FLAG).to_le_bytes());
+        chain.extend(b"xyz");
+        chain.extend((s.len() as u32).to_le_bytes());
+        chain.extend(&s);
+        assert_eq!(decompress_chained(&chain, 13).unwrap(), b"ABCABxyzABCAB");
+        // A stored segment longer than the declared size leaves is refused.
+        assert!(decompress_chained(&chain, 6).is_err());
+        // So is a flagged segment of length 0.
+        let mut empty = (s.len() as u32).to_le_bytes().to_vec();
+        empty.extend(&s);
+        empty.extend(STORED_SEGMENT_FLAG.to_le_bytes());
+        assert!(decompress_chained(&empty, 13).is_err());
+    }
+
+    #[test]
+    fn only_the_last_segment_may_run_past_the_declared_size() {
+        let s = abcab();
+        let mut chain = Vec::new();
+        for _ in 0..2 {
+            chain.extend((s.len() as u32).to_le_bytes());
+            chain.extend(&s);
+        }
+        // The second segment overruns: its tail is dropped.
+        assert_eq!(decompress_chained(&chain, 8).unwrap(), b"ABCABABC");
+        // The first segment overruns while another follows: an error.
+        assert!(decompress_chained(&chain, 4).is_err());
+    }
+
+    #[test]
+    fn a_token_cut_off_past_the_declared_size_does_not_fail_the_chain() {
+        // "ABCAB", then a back-reference tag whose offset bits are missing.
+        let mut s = abcab();
+        s.push(0b0000_0011);
+        let mut chain = (s.len() as u32).to_le_bytes().to_vec();
+        chain.extend(&s);
+        assert_eq!(decompress_chained(&chain, 5).unwrap(), b"ABCAB");
+        assert!(decompress(&s, 5).is_err());
+    }
 
     #[test]
     fn rejects_empty_stream() {
