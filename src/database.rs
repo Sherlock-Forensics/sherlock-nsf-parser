@@ -71,8 +71,12 @@ pub struct Database<'a> {
 }
 
 /// Candidate file positions tried for one summary bucket: the descriptor as
-/// stored, then its group-marker-corrected forms.
-const BUCKET_CANDIDATES: usize = 4;
+/// stored, its group-marker-corrected forms, then the end of the previous
+/// bucket.
+const BUCKET_CANDIDATES: usize = 5;
+/// Index of the derived candidate (where the previous bucket ends) among
+/// [`BUCKET_CANDIDATES`].
+const DERIVED_CANDIDATE: usize = 4;
 
 /// One lazily restored bucket copy; `None` inside for a bucket read as it is.
 type RestoredCell = std::sync::OnceLock<Option<Box<[u8]>>>;
@@ -138,7 +142,31 @@ impl<'a> Database<'a> {
     /// a group marker in its low nibble or in bits 16-19 (where the true
     /// nibble is that of a neighbouring descriptor, buckets being locally
     /// sequential). See [`Self::enumerate_notes`].
-    fn bucket_candidates(fps: &[u32], ord: usize) -> Option<[u32; BUCKET_CANDIDATES]> {
+    ///
+    /// The last candidate is where the previous descriptor's bucket ends:
+    /// its position plus its declared size. A descriptor was seen whose low
+    /// byte read `0x96` where the bucket starts at `0x98`. Neither clearing
+    /// the nibble nor borrowing a neighbour's bits 16-19 reaches it, but the
+    /// previous bucket (63,488 bytes) ends exactly there, and the 192 notes
+    /// of that bucket resolved under the identity gate. The previous bucket
+    /// is located through its own marker-corrected candidates, since a
+    /// neighbouring descriptor can carry a marker too. A position that
+    /// cannot be derived repeats the primary. This candidate is derived,
+    /// not read, so [`Self::resolve_validated`] lets it decide only a
+    /// success, never the reason an entry is withheld.
+    fn bucket_candidates(&self, fps: &[u32], ord: usize) -> Option<[u32; BUCKET_CANDIDATES]> {
+        let [a, b, c, d] = Self::marker_candidates(fps, ord)?;
+        let after_prev = ord
+            .checked_sub(1)
+            .and_then(|p| Self::marker_candidates(fps, p))
+            .and_then(|prev| prev.into_iter().find_map(|p| self.bucket_end(p)))
+            .unwrap_or(a);
+        Some([a, b, c, d, after_prev])
+    }
+
+    /// The descriptor of summary bucket `ord` as stored, then the forms
+    /// that undo a group marker in its low nibble or in bits 16-19.
+    fn marker_candidates(fps: &[u32], ord: usize) -> Option<[u32; 4]> {
         let primary = *fps.get(ord)?;
         let prev_hi = ord
             .checked_sub(1)
@@ -152,6 +180,19 @@ impl<'a> Database<'a> {
             (primary & 0xFFF0_FFFF) | prev_hi,
             (primary & 0xFFF0_FFFF) | next_hi,
         ])
+    }
+
+    /// Where the bucket at file position `fp` ends, in 256-byte units:
+    /// `None` unless a bucket header parses there with a size in whole
+    /// units.
+    fn bucket_end(&self, fp: u32) -> Option<u32> {
+        let off = usize::try_from(u64::from(fp) << 8).ok()?;
+        let header = crate::bucket::BucketHeader::parse(self.bytes.get(off..)?).ok()?;
+        let size = header.size;
+        if size == 0 || size % 256 != 0 {
+            return None;
+        }
+        fp.checked_add(size / 256)
     }
 
     /// The bytes to read candidate `cand` of summary bucket `ord` from, and
@@ -177,7 +218,7 @@ impl<'a> Database<'a> {
     fn bucket_view(&self, ord: usize, cand: usize) -> Option<(u64, &[u8])> {
         use std::sync::atomic::Ordering;
         let fps = self.cached_summary_fps();
-        let candidates = Self::bucket_candidates(fps, ord)?;
+        let candidates = self.bucket_candidates(fps, ord)?;
         let fp = *candidates.get(cand)?;
         // Candidates often coincide; keep one copy for equal positions.
         let cand = candidates.iter().position(|&c| c == fp).unwrap_or(cand);
@@ -658,8 +699,11 @@ impl<'a> Database<'a> {
     /// the low nibble, or bits 16-19 (in which case the true high nibble
     /// matches the locally-sequential neighbours). For each bucket-slot
     /// entry the resolver tries the raw descriptor first, then these
-    /// marker-corrected candidates, accepting the first that passes the
-    /// identity gate. Because acceptance requires an exact 32-bit
+    /// marker-corrected candidates, then the position where the previous
+    /// bucket ends, accepting the first that passes the identity gate. That
+    /// last one is derived from the neighbouring bucket rather than read
+    /// from the descriptor, so its failures never set the withheld reason.
+    /// Because acceptance requires an exact 32-bit
     /// `rrv_identifier` match, a wrong candidate cannot be accepted - the
     /// recovery is heuristic in *what it tries* but never in *what it
     /// returns*.
@@ -1030,9 +1074,10 @@ impl<'a> Database<'a> {
     }
 
     /// Resolve a bucket-slot entry to an identity-verified note, trying the
-    /// raw descriptor first then group-marker-corrected candidates. Errors
-    /// only if no candidate yields a note carrying `expected_id`; the error
-    /// reports the most informative failure any candidate produced.
+    /// raw descriptor first, then group-marker-corrected candidates, then
+    /// the end of the previous bucket. Errors only if no candidate yields a
+    /// note carrying `expected_id`; the error reports the most informative
+    /// failure among the descriptor-based candidates.
     fn resolve_validated(
         &self,
         bucket_index: u32,
@@ -1069,7 +1114,10 @@ impl<'a> Database<'a> {
                     return Ok(note);
                 }
                 Err(e) => {
-                    if e.rank() > best_err.rank() {
+                    // The derived end-of-previous-bucket candidate is not a
+                    // descriptor reading; a miss there says nothing about
+                    // why the descriptor failed.
+                    if cand < DERIVED_CANDIDATE && e.rank() > best_err.rank() {
                         best_err = e;
                     }
                 }
@@ -1448,7 +1496,8 @@ pub struct ResolvedNote {
     /// bucket-slot note; `None` for one reached by file position.
     pub bucket_index: Option<u32>,
     /// Byte offset of that bucket in the file, which for a descriptor
-    /// carrying a group marker is not the offset the descriptor states.
+    /// carrying a group marker, or one found where the previous bucket
+    /// ends, is not the offset the descriptor states.
     pub bucket_offset: Option<u64>,
     /// The parsed note header.
     pub header: NoteHeader,
@@ -1800,6 +1849,32 @@ mod legacy_tests {
         // 0x2300 is left as something that is not a modern note record.
         b[0x2300] = 0x07;
         b
+    }
+
+    /// The last candidate for a summary bucket is where the previous one
+    /// ends, so a descriptor whose low byte is off by a non-marker value is
+    /// still reached.
+    #[test]
+    fn a_bucket_is_also_looked_for_where_the_previous_one_ends() {
+        let mut b = ods20();
+        // A summary bucket header at 0x3000 (position 0x30) declaring 0x400
+        // bytes, so it ends at position 0x34.
+        b[0x3000] = crate::bucket::BUCKET_SIGNATURE;
+        b[0x3001] = 0x42;
+        b[0x3006..0x300A].copy_from_slice(&0x400u32.to_le_bytes());
+        let db = Database::open(&b).unwrap();
+        let fps = [0x30u32, 0x36];
+        assert_eq!(db.bucket_candidates(&fps, 1).unwrap()[BUCKET_CANDIDATES - 1], 0x34);
+        // A previous descriptor with a marker in its low nibble is located
+        // through its own corrected form.
+        let marked = [0x33u32, 0x36];
+        assert_eq!(db.bucket_candidates(&marked, 1).unwrap()[DERIVED_CANDIDATE], 0x34);
+        // The first bucket has no predecessor: the primary is repeated.
+        assert_eq!(db.bucket_candidates(&fps, 0).unwrap()[BUCKET_CANDIDATES - 1], 0x30);
+        // A previous size that is not whole 256-byte units gives no position.
+        b[0x3006..0x300A].copy_from_slice(&0x401u32.to_le_bytes());
+        let db = Database::open(&b).unwrap();
+        assert_eq!(db.bucket_candidates(&fps, 1).unwrap()[BUCKET_CANDIDATES - 1], 0x36);
     }
 
     #[test]
