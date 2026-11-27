@@ -51,7 +51,8 @@ const RRV_DESCRIPTOR_BYTES: usize = 8;
 /// On-disk size of one Unique Name Key table entry in the decompressed
 /// body: `[text_offset: u32][name_length: u16][unused: u32]`.
 const UNK_ENTRY_BYTES: usize = 10;
-/// Bytes of preamble before the UNK name-text payload begins.
+/// Bytes of preamble before the UNK name-text payload begins when it holds
+/// a single segment-length word (see [`unk_text_preamble`]).
 const UNK_TEXT_PREAMBLE: usize = 4;
 
 /// RRV bucket kind. Data buckets hold document/data NoteIDs; non-data
@@ -223,38 +224,13 @@ impl BucketDescriptorBlock {
             });
         }
 
-        // Unique Name Key table: `name_id` -> field-name string. It follows
-        // the RRV descriptors in the decompressed body; each 10-byte entry
-        // indexes into the name-text payload that follows the table (past a
-        // 4-byte preamble). Out-of-bounds entries degrade to empty strings
-        // rather than failing the whole parse.
         let unk_table_start = number_of_rrv_bucket_descriptors * RRV_DESCRIPTOR_BYTES;
-        let text_start = unk_table_start + number_of_unique_name_keys * UNK_ENTRY_BYTES;
-        let text_payload_start = text_start + UNK_TEXT_PREAMBLE;
-        let text_end = (text_start + unique_name_key_text_size).min(body.len());
-        let mut unk_names = Vec::with_capacity(number_of_unique_name_keys);
-        let mut unk_types = Vec::with_capacity(number_of_unique_name_keys);
-        let mut unk_classes = Vec::with_capacity(number_of_unique_name_keys);
-        let text = body.get(text_payload_start..text_end).unwrap_or(&[]);
-        for i in 0..number_of_unique_name_keys {
-            let e = unk_table_start + i * UNK_ENTRY_BYTES;
-            // Entry: [text_offset:u32][name_len:u16][item_type:1][item_class:1][unknown:2]
-            let (name, ty, class) = body
-                .get(e..e + UNK_ENTRY_BYTES)
-                .map(|d| {
-                    let off = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize;
-                    let len = u16::from_le_bytes([d[4], d[5]]) as usize;
-                    let name = text
-                        .get(off..off + len)
-                        .map(|s| String::from_utf8_lossy(s).into_owned())
-                        .unwrap_or_default();
-                    (name, d[6], d[7])
-                })
-                .unwrap_or_default();
-            unk_names.push(name);
-            unk_types.push(ty);
-            unk_classes.push(class);
-        }
+        let (unk_names, unk_types, unk_classes) = parse_unk_table(
+            &body,
+            unk_table_start,
+            number_of_unique_name_keys,
+            unique_name_key_text_size,
+        );
 
         Ok(Self {
             write_count,
@@ -370,9 +346,135 @@ impl BucketDescriptorBlock {
     }
 }
 
+/// Parse the Unique Name Key table: `name_id` -> field-name string, type
+/// and class. It follows the RRV descriptors in the decompressed body; each
+/// 10-byte entry indexes into the name text that follows the table.
+///
+/// The name text is preceded by one u32 length per text segment, and the
+/// lengths add up to the header's `unique_name_key_text_size`. A small
+/// database has one segment, so one word. A database whose names exceed
+/// 64 KiB has more: a 5,141-name database with 113,785 bytes of text was
+/// seen with two words (65,394 + 48,391), and reading past only the first
+/// shifted every name four bytes early (`koopDealnu` for `Dealnummer`).
+/// The text itself is contiguous after the last word: the last entry's
+/// offset plus length equals the text size in both cases.
+///
+/// When no run of words adds up to the text size, the single 4-byte
+/// preamble is assumed, as before. Out-of-bounds entries degrade to empty
+/// strings rather than failing the whole parse.
+fn parse_unk_table(
+    body: &[u8],
+    unk_table_start: usize,
+    number_of_unique_name_keys: usize,
+    unique_name_key_text_size: usize,
+) -> (Vec<String>, Vec<u8>, Vec<u8>) {
+    let text_start = unk_table_start + number_of_unique_name_keys * UNK_ENTRY_BYTES;
+    let preamble = unk_text_preamble(body, text_start, unique_name_key_text_size);
+    let text_payload_start = text_start + preamble;
+    let text_end = (text_payload_start + unique_name_key_text_size).min(body.len());
+    let text = body.get(text_payload_start..text_end).unwrap_or(&[]);
+
+    let mut unk_names = Vec::with_capacity(number_of_unique_name_keys);
+    let mut unk_types = Vec::with_capacity(number_of_unique_name_keys);
+    let mut unk_classes = Vec::with_capacity(number_of_unique_name_keys);
+    for i in 0..number_of_unique_name_keys {
+        let e = unk_table_start + i * UNK_ENTRY_BYTES;
+        // Entry: [text_offset:u32][name_len:u16][item_type:1][item_class:1][unknown:2]
+        let (name, ty, class) = body
+            .get(e..e + UNK_ENTRY_BYTES)
+            .map(|d| {
+                let off = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize;
+                let len = u16::from_le_bytes([d[4], d[5]]) as usize;
+                let name = text
+                    .get(off..off + len)
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .unwrap_or_default();
+                (name, d[6], d[7])
+            })
+            .unwrap_or_default();
+        unk_names.push(name);
+        unk_types.push(ty);
+        unk_classes.push(class);
+    }
+    (unk_names, unk_types, unk_classes)
+}
+
+/// Upper bound on the segment-length words before the UNK name text. Each
+/// segment holds up to 64 KiB, so 64 words cover 4 MiB of names.
+const MAX_UNK_TEXT_SEGMENTS: usize = 64;
+
+/// Bytes of segment-length words before the UNK name text: the shortest
+/// run of u32 words from `text_start` that adds up to `text_size` exactly.
+/// Falls back to [`UNK_TEXT_PREAMBLE`] when no run does.
+fn unk_text_preamble(body: &[u8], text_start: usize, text_size: usize) -> usize {
+    let mut sum = 0usize;
+    for k in 0..MAX_UNK_TEXT_SEGMENTS {
+        let o = text_start + k * 4;
+        let Some(w) = body.get(o..o + 4) else { break };
+        let len = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize;
+        if len == 0 {
+            break;
+        }
+        sum += len;
+        if sum == text_size {
+            return (k + 1) * 4;
+        }
+        if sum > text_size {
+            break;
+        }
+    }
+    UNK_TEXT_PREAMBLE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decompressed BDB body without RRV descriptors: the UNK entries,
+    /// the given segment-length words, then the packed name text.
+    fn unk_body(names: &[&str], segments: &[u32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        let mut off = 0u32;
+        for n in names {
+            b.extend_from_slice(&off.to_le_bytes());
+            b.extend_from_slice(&(n.len() as u16).to_le_bytes());
+            b.extend_from_slice(&[0x00, 0x05, 0x00, 0x00]);
+            off += n.len() as u32;
+        }
+        for s in segments {
+            b.extend_from_slice(&s.to_le_bytes());
+        }
+        for n in names {
+            b.extend_from_slice(n.as_bytes());
+        }
+        // Trailing bytes stand in for the UNK hash table.
+        b.extend_from_slice(&[0xAA; 16]);
+        b
+    }
+
+    #[test]
+    fn unk_names_with_one_segment_include_the_last_name() {
+        let names = ["$UpdatedBy", "Form", "Dealnummer"];
+        let size: usize = names.iter().map(|n| n.len()).sum();
+        let body = unk_body(&names, &[size as u32]);
+        let (got, _, _) = parse_unk_table(&body, 0, names.len(), size);
+        assert_eq!(got, names);
+    }
+
+    #[test]
+    fn unk_names_after_two_segment_words_are_not_shifted() {
+        let names = ["$UpdatedBy", "Form", "Dealnummer"];
+        let size: usize = names.iter().map(|n| n.len()).sum();
+        let body = unk_body(&names, &[10, (size - 10) as u32]);
+        let (got, _, _) = parse_unk_table(&body, 0, names.len(), size);
+        assert_eq!(got, names);
+    }
+
+    #[test]
+    fn unk_preamble_falls_back_to_one_word_when_nothing_adds_up() {
+        let body = unk_body(&["Form"], &[99]);
+        assert_eq!(unk_text_preamble(&body, UNK_ENTRY_BYTES, 4), UNK_TEXT_PREAMBLE);
+    }
 
     /// A legacy BDB laid out like the Notes 4 sample: two RRV descriptors,
     /// one summary descriptor, three names.
