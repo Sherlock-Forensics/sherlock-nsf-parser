@@ -73,6 +73,11 @@ pub const LEGACY_NOTE_HEADER_BYTES: usize = 84;
 /// bytes silently withheld them from enumeration.
 pub const NOTE_HEADER_SHORT_BYTES: usize = 64;
 
+/// Status flag of a response-parent placeholder: a note record that stands
+/// in for a parent document the database does not hold. See
+/// [`NoteHeader::is_placeholder`].
+pub const STATUS_PLACEHOLDER: u16 = 0x0040;
+
 /// Note class flag values. A note's `note_class` is typically one of
 /// these; multi-bit values are uncommon in practice.
 #[allow(missing_docs)]
@@ -105,18 +110,24 @@ pub struct NoteHeader {
     /// Note identifier portion of the UNID (8 bytes). Together with
     /// `file_identifier` this forms the 16-byte Universal Note ID
     /// (UNID) which is globally unique across replicas.
+    ///
+    /// It is a TIMEDATE: when the document was created, in whichever
+    /// replica that happened. See [`Self::document_created`].
     pub note_identifier: Timedate,
     /// Replication-sequence number. Increments on every modification.
     pub sequence_number: u32,
-    /// Replication-sequence time.
+    /// Replication-sequence time: when the version this record holds was
+    /// saved, in whichever replica that happened. See
+    /// [`Self::document_modified`].
     pub sequence_time: Timedate,
     /// Status flags word.
     pub status_flags: u16,
     /// Note class (DOCUMENT / FORM / VIEW / ACL / etc). See [`class`]
     /// constants.
     pub note_class: u16,
-    /// Most recent modification time. Operator-facing "when was this
-    /// note last touched".
+    /// When the note was last written to THIS file. In a replica this is
+    /// the time replication wrote it, not when anyone edited the document;
+    /// for that see [`Self::document_modified`].
     pub modification_time: Timedate,
     /// Number of items (fields) attached to this note. Each item has
     /// its own descriptor block immediately after the note header.
@@ -133,7 +144,9 @@ pub struct NoteHeader {
     /// Most recent access time. `None` in a short (64-byte) header, which
     /// ends before this field.
     pub access_time: Option<Timedate>,
-    /// File-creation time (first-write timestamp). `None` in a short
+    /// When the note was added to THIS file (first-write timestamp); in a
+    /// replica, when replication first brought it in. For when the document
+    /// was created see [`Self::document_created`]. `None` in a short
     /// (64-byte) header, which ends before this field.
     ///
     /// Optional rather than defaulted because this is an evidentiary
@@ -225,6 +238,74 @@ impl NoteHeader {
     /// all carry this bit.
     pub fn is_document(&self) -> bool {
         self.note_class & class::DOCUMENT != 0
+    }
+
+    /// When the document was created: the TIMEDATE in the UNID's note half,
+    /// which every replica of the document shares. `None` when it is not a
+    /// clock value (a UNID assigned by a program can be anything).
+    ///
+    /// Measured on a replica made the day it was read, where every note's
+    /// [`Self::creation_time`] was that day: on 9,047 of 9,082 documents
+    /// whose form stores its own creation date, that date equals this one to
+    /// the second (to the hundredth where the form keeps hundredths). The
+    /// other 35 were documents made from an older one, whose stored date had
+    /// been carried over.
+    pub fn document_created(&self) -> Option<crate::time::DecodedTimedate> {
+        self.note_identifier.as_clock()
+    }
+
+    /// When the version this record holds was saved: the sequence time,
+    /// which replication carries with the version. `None` for a record that
+    /// has none (a placeholder, which no version ever reached, has zero).
+    ///
+    /// On the replica above it was never earlier than the newest entry of
+    /// the document's `$Revisions` (5,289 documents with both); `$Revisions`
+    /// lists the saves before this one. A save by a scheduled agent counts
+    /// as much as one by a person.
+    pub fn document_modified(&self) -> Option<crate::time::DecodedTimedate> {
+        self.sequence_time.as_clock()
+    }
+
+    /// True for a response-parent placeholder: a record that holds a place
+    /// in the response hierarchy for a parent document whose content is not
+    /// in this database, typically because a selective replica received the
+    /// responses but not the parent.
+    ///
+    /// Such a record carries the parent's UNID, status flag
+    /// [`STATUS_PLACEHOLDER`], no items, a response count of one or more,
+    /// and after the header the response notes' RRV identifiers (see
+    /// [`Self::placeholder_responses`]). Measured on a selective
+    /// replica: 19 such records, every one item-less with that flag set and
+    /// every response's `$REF` naming the placeholder's UNID; 18 with
+    /// sequence number 0 and an all-zero sequence time, as no version of the
+    /// parent was ever received. None of 9,082 content notes sampled from
+    /// the same file carries the flag.
+    ///
+    /// A placeholder is not a document whose fields went unread: its fields
+    /// were never in the file. A caller should say so rather than present
+    /// an empty document.
+    pub fn is_placeholder(&self) -> bool {
+        self.status_flags & STATUS_PLACEHOLDER != 0 && self.number_of_note_items == 0
+    }
+
+    /// The RRV identifiers of a placeholder's responses, read from its
+    /// record (`record` starting at the note header): `number_of_responses`
+    /// u32 values right after the 100-byte header. Empty for a note that is
+    /// not a placeholder or a record too short to hold them all; a record
+    /// may carry zero padding after them.
+    pub fn placeholder_responses(&self, record: &[u8]) -> Vec<u32> {
+        if !self.is_placeholder() {
+            return Vec::new();
+        }
+        let n = usize::from(self.number_of_responses);
+        record
+            .get(NOTE_HEADER_BYTES..NOTE_HEADER_BYTES + n * 4)
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// True if the note carries any design-related class bit (FORM,
@@ -339,6 +420,62 @@ mod tests {
         let mut buf = synthetic_note(class::DOCUMENT, 1);
         buf[0] = 0xFF;
         assert!(NoteHeader::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn an_item_less_note_with_the_placeholder_flag_is_a_placeholder() {
+        let mut buf = synthetic_note(class::DOCUMENT, 0);
+        buf[38..40].copy_from_slice(&STATUS_PLACEHOLDER.to_le_bytes());
+        assert!(NoteHeader::parse(&buf).unwrap().is_placeholder());
+
+        // The flag alone, on a note that has items, is not a placeholder.
+        let mut with_items = synthetic_note(class::DOCUMENT, 3);
+        with_items[38..40].copy_from_slice(&STATUS_PLACEHOLDER.to_le_bytes());
+        assert!(!NoteHeader::parse(&with_items).unwrap().is_placeholder());
+
+        // Nor is an empty note without it.
+        assert!(!NoteHeader::parse(&synthetic_note(class::DOCUMENT, 0))
+            .unwrap()
+            .is_placeholder());
+    }
+
+    #[test]
+    fn placeholder_lists_its_responses_and_ignores_padding() {
+        let mut buf = synthetic_note(class::DOCUMENT, 0);
+        buf.truncate(NOTE_HEADER_BYTES);
+        buf[38..40].copy_from_slice(&STATUS_PLACEHOLDER.to_le_bytes());
+        buf[54..56].copy_from_slice(&2u16.to_le_bytes());
+        for id in [0x1002u32, 0x1006, 0] {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        let h = NoteHeader::parse(&buf).unwrap();
+        assert_eq!(h.placeholder_responses(&buf), vec![0x1002, 0x1006]);
+        // A record cut short yields nothing rather than a partial list.
+        assert!(h.placeholder_responses(&buf[..NOTE_HEADER_BYTES + 4]).is_empty());
+    }
+
+    #[test]
+    fn document_dates_come_from_the_unid_and_the_sequence_time() {
+        let mut buf = synthetic_note(class::DOCUMENT, 1);
+        // 2021-03-04 05:06:07.08 UTC as note identifier; a day later as
+        // sequence time. Innards1 = 0xC1 zone byte (+1h, east) | JDN.
+        let created = (5 * 3600 + 6 * 60 + 7) * 100 + 8u32;
+        buf[18..22].copy_from_slice(&created.to_le_bytes());
+        buf[22..26].copy_from_slice(&(0xC100_0000u32 | 2_459_278).to_le_bytes());
+        buf[30..34].copy_from_slice(&created.to_le_bytes());
+        buf[34..38].copy_from_slice(&(0xC100_0000u32 | 2_459_279).to_le_bytes());
+        let h = NoteHeader::parse(&buf).unwrap();
+        let c = h.document_created().expect("clock value");
+        let m = h.document_modified().expect("clock value");
+        assert_eq!(c.unix_seconds_utc, 1_614_834_367);
+        assert_eq!(c.centiseconds, 8);
+        assert_eq!(m.unix_seconds_utc - c.unix_seconds_utc, 86_400);
+
+        // A placeholder's zero sequence time is no date.
+        assert!(NoteHeader::parse(&synthetic_note(class::DOCUMENT, 0))
+            .unwrap()
+            .document_modified()
+            .is_none());
     }
 
     #[test]

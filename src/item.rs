@@ -257,7 +257,7 @@ impl<'a> NoteItem<'a> {
         let mut off = header;
         for l in lens {
             let end = off + l;
-            out.push(String::from_utf8_lossy(&v[off..end]).into_owned());
+            out.push(crate::lmbcs::decode(&v[off..end]));
             off = end;
         }
         Some(out)
@@ -397,6 +397,8 @@ impl NoteItem<'_> {
             | FieldKind::MimePart => {
                 if self.is_printable_text() {
                     self.as_text()
+                } else if let Some(t) = self.as_lmbcs_text() {
+                    t
                 } else if let Some(t) = self.as_multiline_text() {
                     t
                 } else {
@@ -478,6 +480,42 @@ impl NoteItem<'_> {
         Some(out.join("; "))
     }
 
+    /// A text value decoded from LMBCS, the character set Notes stores text
+    /// in, with NUL line separators as line breaks. `None` when the value
+    /// opens with a NUL, or when it decodes to a U+FFFD or to a control
+    /// character other than tab and line breaks: then it is not clean text,
+    /// and [`Self::as_multiline_text`] or hex takes over. Also `None` when
+    /// fewer than three in four bytes are printable ASCII or a tab or line
+    /// break: the single-byte code page maps every byte from `0x80`, so a
+    /// UNID or an integer would otherwise decode to plausible letters.
+    ///
+    /// Without this a text value with a single non-ASCII character was read
+    /// byte by byte: the euro sign `03 80` in LotusScript source came out as
+    /// `..`, and an accented name such as `M 81 ller` failed the
+    /// printable-ASCII test.
+    pub fn as_lmbcs_text(&self) -> Option<String> {
+        let v = self.data();
+        if v.is_empty() || v.first() == Some(&0) {
+            return None;
+        }
+        let ascii = v
+            .iter()
+            .filter(|&&b| (0x20..0x7f).contains(&b) || matches!(b, b'\t' | b'\r' | b'\n'))
+            .count();
+        if ascii * 4 < v.len() * 3 {
+            return None;
+        }
+        let decoded = crate::lmbcs::decode(v);
+        let clean = decoded.chars().all(|c| {
+            c != '\u{FFFD}' && (!c.is_control() || matches!(c, '\0' | '\t' | '\r' | '\n'))
+        });
+        if !clean {
+            return None;
+        }
+        let text: String = decoded.chars().map(|c| if c == '\0' { '\n' } else { c }).collect();
+        Some(text.trim_end_matches('\n').to_string())
+    }
+
     /// Text whose line breaks are stored as NUL bytes, the way a Notes text
     /// item separates lines. A customer's `$AdditionalHeaders` - a stored
     /// header block - still rendered as hex after CR/LF was allowed, and NUL
@@ -552,8 +590,9 @@ impl NoteItem<'_> {
             size: u32_at(16)?,
             created: Timedate::from_bytes(v.get(20..28)?).ok(),
             modified: Timedate::from_bytes(v.get(28..36)?).ok(),
-            name: String::from_utf8_lossy(name).into_owned(),
-            encrypted: self.type_flags & ITEM_SEAL != 0,
+            name: crate::lmbcs::decode(name),
+            sealable: self.type_flags & ITEM_SEAL != 0,
+            encrypted: false,
         })
     }
 
@@ -590,12 +629,27 @@ pub struct FileObject {
     pub created: Option<Timedate>,
     /// File modification time as recorded at attach time.
     pub modified: Option<Timedate>,
-    /// File name as attached.
+    /// File name as attached, decoded from LMBCS.
     pub name: String,
-    /// The item is sealed ([`ITEM_SEAL`]): the object holds the file
-    /// encrypted to the recipients' Notes IDs, and the descriptor alone is
-    /// readable.
+    /// The item carries [`ITEM_SEAL`]: encryption of the note would cover
+    /// this file. Notes sets it on `$FILE` items as a matter of course - all
+    /// 25,463 in a database with no encrypted note carry it, together with
+    /// the sign and summary flags - so on its own it says nothing about
+    /// whether the file IS encrypted.
+    pub sealable: bool,
+    /// The file is encrypted: the item is [`Self::sealable`] and its note is
+    /// sealed. Only [`crate::Database::file_objects`], which sees the note,
+    /// sets it; [`NoteItem::as_file_object`] alone leaves it `false`.
     pub encrypted: bool,
+}
+
+impl FileObject {
+    /// This descriptor as found in a note that is, or is not, sealed (see
+    /// [`crate::Database::note_is_sealed`]).
+    pub fn in_note(mut self, note_sealed: bool) -> Self {
+        self.encrypted = self.sealable && note_sealed;
+        self
+    }
 }
 
 /// One TIMEDATE as ISO 8601, or its hex when it is not a clock value (an
@@ -721,6 +775,23 @@ pub fn non_summary_total(record: &[u8], number_of_note_items: u16, header_len: u
     )
 }
 
+/// Offset in the record just past the last summary value: the header, the
+/// descriptor table, and every summary item's declared size. `None` when
+/// the table does not fit.
+pub fn summary_values_end(record: &[u8], number_of_note_items: u16, header_len: usize) -> Option<usize> {
+    let count = number_of_note_items as usize;
+    let table_end = header_len + count * ITEM_DESCRIPTOR_BYTES;
+    record.get(..table_end)?;
+    Some(
+        table_end
+            + (0..count)
+                .map(|i| header_len + i * ITEM_DESCRIPTOR_BYTES)
+                .filter(|&d| u16::from_le_bytes([record[d + 2], record[d + 3]]) & ITEM_SUMMARY != 0)
+                .map(|d| u16::from_le_bytes([record[d + 4], record[d + 5]]) as usize)
+                .sum::<usize>(),
+    )
+}
+
 /// The general walk: an item table starting at `header_len`, and optionally
 /// the note's non-summary data as bare item values.
 ///
@@ -728,7 +799,9 @@ pub fn non_summary_total(record: &[u8], number_of_note_items: u16, header_len: u
 /// values in descriptor order - the caller checks that the sizes add up
 /// (see [`non_summary_total`]) - and those items then get their values from
 /// it instead of being reported as stored elsewhere. That is the pre-Notes 5
-/// layout; a modern non-summary object has a header and is not passed here.
+/// layout, and the modern one once the object's header is taken off or the
+/// values are found inside the record (see
+/// [`crate::Database::non_summary_values`]).
 pub fn walk_items_at<'a>(
     record: &'a [u8],
     number_of_note_items: u16,
@@ -818,7 +891,10 @@ pub fn walk_items_at<'a>(
 /// be found.
 pub const ITEM_SUMMARY: u16 = 0x0004;
 
-/// Field flag: the value is sealed (encrypted). On a `$FILE` the
+/// Field flag: encrypting the note would encrypt this item. It is set on
+/// items that are not encrypted too (every `$FILE` carries it); a value is
+/// encrypted only in a sealed note (see
+/// [`crate::Database::note_is_sealed`]). In a sealed note a `$FILE`
 /// descriptor stays in the clear and the object it names is encrypted.
 pub const ITEM_SEAL: u16 = 0x0002;
 
@@ -1068,25 +1144,44 @@ mod typed_value_tests {
     }
 
     fn file_value(name: &str) -> Vec<u8> {
+        file_value_bytes(name.as_bytes())
+    }
+
+    fn file_value_bytes(name: &[u8]) -> Vec<u8> {
         let mut v = vec![0u8; 36];
         v[2..6].copy_from_slice(&52654u32.to_le_bytes());
         v[6..8].copy_from_slice(&(name.len() as u16).to_le_bytes());
         v[10..12].copy_from_slice(&1u16.to_le_bytes());
         v[16..20].copy_from_slice(&5131u32.to_le_bytes());
-        v.extend_from_slice(name.as_bytes());
+        v.extend_from_slice(name);
         v
     }
 
-    /// A sealed `$FILE` keeps its descriptor readable; only the object is
-    /// encrypted. The flag is what lets a failure say so.
+    /// The name is LMBCS like every other Notes text: a Latin-2 letter is
+    /// group 6 and a bare high byte is code page 850. Read as UTF-8 each of
+    /// them became U+FFFD.
     #[test]
-    fn a_sealed_file_item_is_marked_encrypted() {
+    fn a_file_name_is_decoded_from_lmbcs() {
+        let v = file_value_bytes(b"Poro\x06\x9Filo za \x84o.pdf");
+        let fo = item(ITEM_NO_TYPE_WORD, &v).as_file_object().expect("descriptor");
+        assert_eq!(fo.name, "Poro\u{10d}ilo za \u{e4}o.pdf");
+    }
+
+    /// ITEM_SEAL on a `$FILE` is set whether or not anything is encrypted;
+    /// the file is encrypted only when its note is sealed as well.
+    #[test]
+    fn a_seal_flag_alone_does_not_make_a_file_encrypted() {
         let v = file_value("Budget.xls");
         let plain = item(ITEM_NO_TYPE_WORD, &v).as_file_object().expect("descriptor");
-        assert!(!plain.encrypted);
+        assert!(!plain.sealable && !plain.encrypted);
         assert_eq!((plain.object_rrv, plain.size, plain.name.as_str()), (52654, 5131, "Budget.xls"));
+        assert!(!plain.clone().in_note(true).encrypted);
+
         let sealed = item(ITEM_NO_TYPE_WORD | ITEM_SEAL, &v).as_file_object().expect("descriptor");
-        assert!(sealed.encrypted);
+        assert!(sealed.sealable);
+        assert!(!sealed.encrypted);
+        assert!(!sealed.clone().in_note(false).encrypted);
+        assert!(sealed.clone().in_note(true).encrypted);
         assert_eq!(sealed.name, "Budget.xls");
     }
 
@@ -1955,6 +2050,14 @@ mod text_list_tests {
         assert_eq!(item(&v).as_text_list().unwrap(), vec!["CN=Alice/O=Acme"]);
     }
 
+    /// Entries are LMBCS, like any Notes text.
+    #[test]
+    fn entries_are_decoded_from_lmbcs() {
+        let mut v = vec![2, 0, 5, 0, 2, 0];
+        v.extend_from_slice(b"\x06\xE7ola\x81b");
+        assert_eq!(item(&v).as_text_list().unwrap(), vec!["\u{161}ola", "\u{fc}b"]);
+    }
+
     #[test]
     fn rejects_anything_that_does_not_fit_exactly() {
         // Entries run together with no delimiter, so a length that is wrong
@@ -1995,6 +2098,33 @@ mod text_list_tests {
         let v = b"plain text value";
         let out = item(v).render(FieldKind::TextList);
         assert_eq!(out, "plain text value");
+    }
+
+    #[test]
+    fn text_is_decoded_as_lmbcs_rather_than_byte_by_byte() {
+        // `03 80` is the euro sign, a bare `81` is `u` with diaeresis, and
+        // a NUL separates lines; byte by byte these came out as dots.
+        let v = b"Case \"EC\", \"\x03\x80\"\x00M\x81ller";
+        assert_eq!(item(v).render(FieldKind::Text), "Case \"EC\", \"\u{20AC}\"\nM\u{FC}ller");
+    }
+
+    #[test]
+    fn binary_bytes_in_a_text_field_do_not_pass_as_lmbcs() {
+        // A group byte that names no group decodes to U+FFFD: the value is
+        // not clean text and must not come out looking like it is.
+        let v = b"\x07\x01\x02\x03";
+        assert_eq!(item(v).as_lmbcs_text(), None);
+    }
+
+    #[test]
+    fn mostly_non_ascii_bytes_do_not_pass_as_lmbcs() {
+        // Every byte decodes cleanly here, but a UNID or an integer is no
+        // text: these must fall through to hex, not render as letters.
+        let unid = b"\xc9\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f";
+        assert_eq!(item(unid).as_lmbcs_text(), None);
+        assert_eq!(item(b"A\x00\x00\x00").as_lmbcs_text(), None);
+        // A short name with one accented letter still passes.
+        assert_eq!(item(b"M\x81ller").as_lmbcs_text().as_deref(), Some("M\u{FC}ller"));
     }
 }
 
