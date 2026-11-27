@@ -397,6 +397,8 @@ impl NoteItem<'_> {
             | FieldKind::MimePart => {
                 if self.is_printable_text() {
                     self.as_text()
+                } else if let Some(t) = self.as_lmbcs_text() {
+                    t
                 } else if let Some(t) = self.as_multiline_text() {
                     t
                 } else {
@@ -476,6 +478,42 @@ impl NoteItem<'_> {
             out.push(format!("{} - {}", entry(&body[o..o + 8]), entry(&body[o + 8..o + 16])));
         }
         Some(out.join("; "))
+    }
+
+    /// A text value decoded from LMBCS, the character set Notes stores text
+    /// in, with NUL line separators as line breaks. `None` when the value
+    /// opens with a NUL, or when it decodes to a U+FFFD or to a control
+    /// character other than tab and line breaks: then it is not clean text,
+    /// and [`Self::as_multiline_text`] or hex takes over. Also `None` when
+    /// fewer than three in four bytes are printable ASCII or a tab or line
+    /// break: the single-byte code page maps every byte from `0x80`, so a
+    /// UNID or an integer would otherwise decode to plausible letters.
+    ///
+    /// Without this a text value with a single non-ASCII character was read
+    /// byte by byte: the euro sign `03 80` in LotusScript source came out as
+    /// `..`, and an accented name such as `M 81 ller` failed the
+    /// printable-ASCII test.
+    pub fn as_lmbcs_text(&self) -> Option<String> {
+        let v = self.data();
+        if v.is_empty() || v.first() == Some(&0) {
+            return None;
+        }
+        let ascii = v
+            .iter()
+            .filter(|&&b| (0x20..0x7f).contains(&b) || matches!(b, b'\t' | b'\r' | b'\n'))
+            .count();
+        if ascii * 4 < v.len() * 3 {
+            return None;
+        }
+        let decoded = crate::lmbcs::decode(v);
+        let clean = decoded.chars().all(|c| {
+            c != '\u{FFFD}' && (!c.is_control() || matches!(c, '\0' | '\t' | '\r' | '\n'))
+        });
+        if !clean {
+            return None;
+        }
+        let text: String = decoded.chars().map(|c| if c == '\0' { '\n' } else { c }).collect();
+        Some(text.trim_end_matches('\n').to_string())
     }
 
     /// Text whose line breaks are stored as NUL bytes, the way a Notes text
@@ -2060,6 +2098,33 @@ mod text_list_tests {
         let v = b"plain text value";
         let out = item(v).render(FieldKind::TextList);
         assert_eq!(out, "plain text value");
+    }
+
+    #[test]
+    fn text_is_decoded_as_lmbcs_rather_than_byte_by_byte() {
+        // `03 80` is the euro sign, a bare `81` is `u` with diaeresis, and
+        // a NUL separates lines; byte by byte these came out as dots.
+        let v = b"Case \"EC\", \"\x03\x80\"\x00M\x81ller";
+        assert_eq!(item(v).render(FieldKind::Text), "Case \"EC\", \"\u{20AC}\"\nM\u{FC}ller");
+    }
+
+    #[test]
+    fn binary_bytes_in_a_text_field_do_not_pass_as_lmbcs() {
+        // A group byte that names no group decodes to U+FFFD: the value is
+        // not clean text and must not come out looking like it is.
+        let v = b"\x07\x01\x02\x03";
+        assert_eq!(item(v).as_lmbcs_text(), None);
+    }
+
+    #[test]
+    fn mostly_non_ascii_bytes_do_not_pass_as_lmbcs() {
+        // Every byte decodes cleanly here, but a UNID or an integer is no
+        // text: these must fall through to hex, not render as letters.
+        let unid = b"\xc9\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f";
+        assert_eq!(item(unid).as_lmbcs_text(), None);
+        assert_eq!(item(b"A\x00\x00\x00").as_lmbcs_text(), None);
+        // A short name with one accented letter still passes.
+        assert_eq!(item(b"M\x81ller").as_lmbcs_text().as_deref(), Some("M\u{FC}ller"));
     }
 }
 
